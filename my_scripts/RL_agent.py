@@ -258,7 +258,15 @@ def train(agent, concept_extractor, video_folder, num_episodes):
                 original_features = video_description
                 # original_features = concept_extractor(frames_tensor)  # Shape: (1, seq_len, num_concepts)
 
+            dic = {
+                "image_descriptions": image_descriptions,
+                "video_description": video_description
+            }
+            with open('/scratch3/kat049/STVT/STVT/STVT/datasets/datasets/datasets/ydata-tvsum50-v1_1/RBCABdttQmI_dictionary.pkl', 'wb') as f:  # 'wb' for write binary
+                pickle.dump(dic, f)
+
             # Optimization
+            # [0, 25, 50, 75, 100, 125, 150, 175, 200, 225, 250, 275, 300, 325, 350]
             f = pickle.load(open("/scratch3/kat049/STVT/STVT/STVT/datasets/datasets/datasets/ydata-tvsum50-v1_1/RBCABdttQmI_dictionary.pkl", "rb"))
             image_descriptions = f['image_descriptions']
             video_description = f['video_description']
