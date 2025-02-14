@@ -1,3 +1,4 @@
+import pickle
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -12,7 +13,7 @@ from PIL import Image
 import re
 import tqdm
 from transformers import AutoTokenizer, AutoModelForCausalLM
-
+from scipy.optimize import minimize  # For optimization
 
 # --- Hyperparameters (Adjust these) ---
 FRAME_HISTORY_LENGTH = 5  # Number of previous frames to include in state
@@ -32,8 +33,8 @@ ConceptExtractor = VideoLlavaForConditionalGeneration.from_pretrained("LanguageB
 ConceptExtractor.to(cuda)
 processor = VideoLlavaProcessor.from_pretrained("LanguageBind/Video-LLaVA-7B-hf")
 
-tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-2-13b-chat-hf")
-llm_model = AutoModelForCausalLM.from_pretrained("meta-llama/Llama-2-13b-chat-hf", torch_dtype=torch.float16).to(cuda)
+# tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-2-13b-chat-hf")
+# llm_model = AutoModelForCausalLM.from_pretrained("meta-llama/Llama-2-13b-chat-hf", torch_dtype=torch.float16).to(cuda)
 
 # # --- Concept Extraction (Replace with your actual model) ---
 # class ConceptExtractor(nn.Module):
@@ -124,6 +125,7 @@ def get_frame_features(video_folder, video_file, concept_extractor):
     ]
     
     frames = []
+    image_descriptions = []
     all_concepts = set()
     original_prominences = defaultdict(float)
     video = VideoFileClip(video_path)
@@ -154,26 +156,79 @@ def get_frame_features(video_folder, video_file, concept_extractor):
             assistant_responses.append(match.strip())
         
         img_description = ", ".join(assistant_responses) # Extract concepts from the response
+        image_descriptions.append(img_description)
+        # prompt_llm = f"""Find the key concepts in the given paragraph. Avoid speculation or interpretation. Give the output as a comma separated list of key concepts. 
+        #     Paragraph: {img_description}
+        #     Output:         
+        # """
+        # inputs = tokenizer(prompt_llm, return_tensors="pt").to(cuda)
+        # generate_ids = llm_model.generate(
+        #     inputs.input_ids,
+        # )
+        # generated_text = tokenizer.decode(generate_ids[0], skip_special_tokens=True)
+        # prompt_length = len(tokenizer.decode(inputs.input_ids[0], skip_special_tokens=True))
+        # output_text = generated_text[prompt_length:]
+        # concept_list = [concept.strip() for concept in output_text.split(",")]
+        # for concept_id in concept_list:
+        #     all_concepts.add(concept_id)
+        #     original_prominences[concept_id] += 1 # Increment prominence
 
-        prompt_llm = f"""Find the key concepts in the given paragraph. Avoid speculation or interpretation. Give the output as a comma separated list of key concepts. 
-            Paragraph: {img_description}
-            Output:         
-        """
-        inputs = tokenizer(prompt_llm, return_tensors="pt").to(cuda)
-        generate_ids = llm_model.generate(
-            inputs.input_ids,
-        )
-        generated_text = tokenizer.decode(generate_ids[0], skip_special_tokens=True)
-        prompt_length = len(tokenizer.decode(inputs.input_ids[0], skip_special_tokens=True))
-        output_text = generated_text[prompt_length:]
-        concept_list = [concept.strip() for concept in output_text.split(",")]
-        for concept_id in concept_list:
-            all_concepts.add(concept_id)
-            original_prominences[concept_id] += 1 # Increment prominence
+
+    return image_descriptions, frames
+
+def my_objective(image_descriptions, video_description):
+    tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-2-13b-chat-hf")
+    num_frames = len(image_descriptions)
+    video_ids = tokenizer(video_description, return_tensors="pt").to(cuda).input_ids
+    video_id_set = set(video_ids[0].tolist())
+
+    overlaps = []
+
+    for i, image_description in enumerate(image_descriptions):
+        image_ids = tokenizer(image_description, return_tensors="pt").to(cuda).input_ids
+        image_ids_set = set(image_ids[0].tolist())
+        overlap = len(video_id_set & image_ids_set)
+        overlaps.append((overlap, i))
 
 
-    return all_concepts, original_prominences, frames
 
+
+# --- Optimization Objective Function ---
+def objective_function(x, frames_tensor, original_features, all_concepts, original_prominences, concept_extractor):
+    """Calculates the objective function value for a given set of selected frames."""
+    num_frames = len(x)
+    selected_frames = [i for i, val in enumerate(x) if val > 0.5]  # Get indices of selected frames
+    summary_features_list = []
+    current_concepts = set()
+    current_prominences = defaultdict(float)
+
+    if selected_frames:
+      for t in selected_frames:
+        frame_tensor = frames_tensor[:, t, :, :, :].unsqueeze(1)
+        with torch.no_grad():
+            frame_features = concept_extractor(frame_tensor)
+            summary_features_list.append(frame_features)
+            selected_frame_features = concept_extractor(frame_tensor)
+            selected_concepts = selected_frame_features.argmax(dim=-1).tolist()[0]
+            for concept_id in selected_concepts:
+                current_concepts.add(concept_id)
+                current_prominences[concept_id] += 1
+      current_concepts = list(current_concepts)
+
+    sc = calculate_sc(current_concepts, all_concepts)
+    sp = calculate_sp(current_prominences, original_prominences)
+    qc = calculate_qc(current_concepts)
+    distance = calculate_distance(torch.stack(summary_features_list) if summary_features_list else torch.zeros(1,0,NUM_CONCEPTS).to("cuda" if torch.cuda.is_available() else "cpu"), original_features)
+
+    num_selected = sum(x)
+
+    objective_value = (METRIC_WEIGHTS["SC"] * sc +
+                       METRIC_WEIGHTS["SP"] * sp +
+                       METRIC_WEIGHTS["QC"] * qc -
+                       METRIC_WEIGHTS["D"] * distance -
+                       METRIC_WEIGHTS["N"] * num_selected)  # Penalty for number of selected frames
+
+    return -objective_value  # Negative because minimize() finds the minimum
 
 # --- Training Loop ---
 def train(agent, concept_extractor, video_folder, num_episodes):
@@ -182,20 +237,41 @@ def train(agent, concept_extractor, video_folder, num_episodes):
     for episode in range(num_episodes):
         video_files = [f for f in os.listdir(video_folder) if f.endswith(('.mp4', '.avi', '.mov'))]
         for video_file in video_files:
-            all_concepts, original_prominences, frames = get_frame_features(video_folder, video_file, concept_extractor)
-            all_concepts = list(all_concepts)  # Convert to list for indexing
+            image_descriptions, frames = get_frame_features(video_folder, video_file, concept_extractor)
+            # all_concepts = list(all_concepts)  # Convert to list for indexing
             num_frames = len(frames)
             frames_tensor = torch.tensor(frames).to(f"{cuda}" if torch.cuda.is_available() else "cpu")  # Shape: (1, seq_len, 3, 224, 224)
             with torch.no_grad():
                 prompt = [
-                    "USER: <video> Provide a list of concepts present in the video. ASSISTANT:"
+                    "USER: <video> Provide a factual description of this video. Avoid speculation or interpretation. ASSISTANT:"
                 ]
                 inputs = processor(text=prompt, videos=frames_tensor, padding=True, return_tensors="pt")
                 inputs = {k: v.to(cuda) for k, v in inputs.items()}
                 generate_ids = concept_extractor.generate(**inputs, max_new_tokens=500)
                 response = processor.batch_decode(generate_ids, skip_special_tokens=True, clean_up_tokenization_spaces=True)
-
+                assistant_responses = []
+                matches = re.findall(r"ASSISTANT:\s*(.+?)(?=(?:USER:|ASSISTANT:|$))", response[0], re.DOTALL)  # Improved regex
+                for match in matches:
+                    assistant_responses.append(match.strip())
+                
+                video_description = ", ".join(assistant_responses) # Extract concepts from the response
+                original_features = video_description
                 # original_features = concept_extractor(frames_tensor)  # Shape: (1, seq_len, num_concepts)
+
+            # Optimization
+            f = pickle.load(open("/scratch3/kat049/STVT/STVT/STVT/datasets/datasets/datasets/ydata-tvsum50-v1_1/RBCABdttQmI_dictionary.pkl", "rb"))
+            image_descriptions = f['image_descriptions']
+            video_description = f['video_description']
+            num_frames = len(image_descriptions)
+            initial_guess = np.zeros(num_frames)  # Start with no frames selected
+            bounds = [(0, 1)] * num_frames  # Binary variables (0 or 1)
+            result = minimize(objective_function, initial_guess, args=(frames_tensor, original_features, all_concepts, original_prominences, concept_extractor), bounds=bounds, method='trust-constr') # trust-constr,  SLSQP, or others
+            selected_frames = [i for i, val in enumerate(result.x) if val > 0.5]  # Get selected frame indices
+
+
+
+
+
 
             summary_features_list = []  # Store features of selected frames
             selected_frames = []
