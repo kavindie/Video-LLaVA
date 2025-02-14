@@ -6,7 +6,7 @@ import torchvision.transforms as transforms
 import cv2
 import numpy as np
 import os
-from collections import defaultdict
+from collections import Counter, defaultdict
 from transformers import VideoLlavaProcessor, VideoLlavaForConditionalGeneration
 from moviepy.editor import VideoFileClip, concatenate_videoclips
 from PIL import Image
@@ -14,6 +14,9 @@ import re
 import tqdm
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from scipy.optimize import minimize  # For optimization
+
+from nltk.corpus import stopwords
+nltk.download('stopwords')
 
 # --- Hyperparameters (Adjust these) ---
 FRAME_HISTORY_LENGTH = 5  # Number of previous frames to include in state
@@ -35,6 +38,8 @@ processor = VideoLlavaProcessor.from_pretrained("LanguageBind/Video-LLaVA-7B-hf"
 
 # tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-2-13b-chat-hf")
 # llm_model = AutoModelForCausalLM.from_pretrained("meta-llama/Llama-2-13b-chat-hf", torch_dtype=torch.float16).to(cuda)
+
+stop_words = set(stopwords.words('english'))
 
 # # --- Concept Extraction (Replace with your actual model) ---
 # class ConceptExtractor(nn.Module):
@@ -179,17 +184,29 @@ def get_frame_features(video_folder, video_file, concept_extractor):
 def my_objective(image_descriptions, video_description):
     tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-2-13b-chat-hf")
     num_frames = len(image_descriptions)
-    video_ids = tokenizer(video_description, return_tensors="pt").to(cuda).input_ids
-    video_id_set = set(video_ids[0].tolist())
+    video_tokens = tokenizer(video_description, return_tensors="pt").to(cuda).input_ids[0].tolist()
+    video_tokens_filtered = [i for i in video_tokens if tokenizer.decode(i).lower() in stop_words ]
+    
+    
+    video_tokens_set = set(video_tokens_filtered)
+    video_token_freq = Counter(video_tokens_filtered) 
 
     overlaps = []
-
+    overlap_frequency = []
     for i, image_description in enumerate(image_descriptions):
-        image_ids = tokenizer(image_description, return_tensors="pt").to(cuda).input_ids
-        image_ids_set = set(image_ids[0].tolist())
-        overlap = len(video_id_set & image_ids_set)
+        image_tokens = tokenizer(image_description, return_tensors="pt").to(cuda).input_ids[0].tolist()
+        image_tokens_filtered = [i for i in image_tokens if tokenizer.decode(i).lower() in stop_words ]
+    
+        image_tokens_set = set(image_tokens_filtered)
+        overlap = len(video_tokens_set & image_tokens_set)
         overlaps.append((overlap, i))
 
+        overlap_weighted = sum(video_token_freq[token] for token in image_tokens_set if token in video_token_freq)
+        overlap_frequency.append((overlap_weighted, i))
+
+    ranked_tensors = sorted(overlaps, key=lambda x: x[0], reverse=True)
+    max_overlap = ranked_tensors[0][0]
+    top_tensors = [t for overlap, t in ranked_tensors if overlap == max_overlap]
 
 
 
