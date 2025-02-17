@@ -14,9 +14,12 @@ import re
 import tqdm
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from scipy.optimize import minimize  # For optimization
-
+import nltk
 from nltk.corpus import stopwords
 nltk.download('stopwords')
+
+from matplotlib import pyplot as plt
+import matplotlib.image as mpimg
 
 # --- Hyperparameters (Adjust these) ---
 FRAME_HISTORY_LENGTH = 5  # Number of previous frames to include in state
@@ -36,7 +39,7 @@ ConceptExtractor = VideoLlavaForConditionalGeneration.from_pretrained("LanguageB
 ConceptExtractor.to(cuda)
 processor = VideoLlavaProcessor.from_pretrained("LanguageBind/Video-LLaVA-7B-hf")
 
-# tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-2-13b-chat-hf")
+tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-2-13b-chat-hf")
 # llm_model = AutoModelForCausalLM.from_pretrained("meta-llama/Llama-2-13b-chat-hf", torch_dtype=torch.float16).to(cuda)
 
 stop_words = set(stopwords.words('english'))
@@ -58,7 +61,7 @@ stop_words = set(stopwords.words('english'))
 #         return features
 
 
-# concept_extractor = ConceptExtractor().to(f"{cuda}" if torch.cuda.is_available() else "cpu")
+# concept_extractor = ConceptExtractor().to(cuda if torch.cuda.is_available() else "cpu")
 # concept_extractor.load_state_dict(torch.load(CONCEPT_EXTRACTION_MODEL_PATH)) # Load your trained model
 # concept_extractor.eval()
 
@@ -104,6 +107,11 @@ def calculate_distance(summary_features, original_features):
     distance = 1 - similarity
     return distance.item()
 
+def rank(overlaps, position=0):
+    ranked_tensors = sorted(overlaps, key=lambda x: x[0], reverse=True)
+    max_overlap = ranked_tensors[position][0]
+    top_tensors = [t for overlap, t in ranked_tensors if overlap == max_overlap]
+    return ranked_tensors, top_tensors
 
 # --- RL Agent ---
 class Agent(nn.Module):
@@ -134,6 +142,7 @@ def get_frame_features(video_folder, video_file, concept_extractor):
     all_concepts = set()
     original_prominences = defaultdict(float)
     video = VideoFileClip(video_path)
+
 
     interval = 25  #??
 
@@ -179,7 +188,31 @@ def get_frame_features(video_folder, video_file, concept_extractor):
         #     original_prominences[concept_id] += 1 # Increment prominence
 
 
-    return image_descriptions, frames
+    return image_descriptions, frames, timestamps
+
+
+def plot(user_annotated, top_sc , top_sp, top_qc, image_path):
+    row_titles = ["User annotation", "Semantic Coverage", "Semantic Prominence", "Quality Coverage"]  # Titles for each row
+    cols = max(len(user_annotated), len(top_sc), len(top_sc), len(top_qc))
+    fig, axes = plt.subplots(4, cols, figsize=(20, 10), squeeze=False)  
+    for i, lst in enumerate([user_annotated, top_sc , top_sp, top_qc]):  # Iterate through the lists (rows)
+        for j in range(cols):  # Iterate through the columns
+            if j < len(lst):  # Check if there's an image for this cell
+                try:
+                    img = mpimg.imread(f'{image_path}/frame_{lst[j]}.jpg')  # Read the image
+                    axes[i, j].imshow(img)  # Display the image
+                    axes[i, j].axis('off')  # Turn off axis labels and ticks
+                except FileNotFoundError:
+                    print(f"Image not found: {lst[j]}")
+                    axes[i,j].axis('off') # Turn off axis labels and ticks even if no image.
+                    axes[i, j].text(0.5, 0.5, "Image Not Found", ha='center', va='center', fontsize=12, color='red') # Add text
+            else:
+                axes[i, j].axis('off')  # Turn off axis for empty cells
+        axes[i, 0].set_title(row_titles[i]) # Rotate title
+    plt.tight_layout()  # Add padding around ylabel
+    plt.savefig("image_grid.png", dpi=300)  # Save as PNG, adjust dpi as needed
+    
+
 
 def my_objective(image_descriptions, video_description):
     tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-2-13b-chat-hf")
@@ -193,22 +226,30 @@ def my_objective(image_descriptions, video_description):
 
     overlaps = []
     overlap_frequency = []
+    non_overlaps_vs_overlaps = []
     for i, image_description in enumerate(image_descriptions):
         image_tokens = tokenizer(image_description, return_tensors="pt").to(cuda).input_ids[0].tolist()
         image_tokens_filtered = [i for i in image_tokens if tokenizer.decode(i).lower() in stop_words ]
     
         image_tokens_set = set(image_tokens_filtered)
+
         overlap = len(video_tokens_set & image_tokens_set)
         overlaps.append((overlap, i))
 
         overlap_weighted = sum(video_token_freq[token] for token in image_tokens_set if token in video_token_freq)
         overlap_frequency.append((overlap_weighted, i))
 
-    ranked_tensors = sorted(overlaps, key=lambda x: x[0], reverse=True)
-    max_overlap = ranked_tensors[0][0]
-    top_tensors = [t for overlap, t in ranked_tensors if overlap == max_overlap]
+        # video concepts not covered = video concepts - (intersection of video and image concepts)
+        non_overlap = len(video_tokens_set) - len(video_tokens_set & image_tokens_set)
+        quality_coverage = non_overlap/overlap if overlap > 0 else 0
+        non_overlaps_vs_overlaps.append((quality_coverage, i))
 
 
+    ranked_tensors_sc, top_tensors_sc = rank(overlaps)
+    ranked_tensors_sp, top_tensors_sp = rank(overlap_frequency)
+    ranked_tensors_qc, top_tensors_qc = rank(non_overlaps_vs_overlaps, position=-1)
+
+    return ranked_tensors_sc, top_tensors_sc , ranked_tensors_sp, top_tensors_sp, ranked_tensors_qc, top_tensors_qc
 
 # --- Optimization Objective Function ---
 def objective_function(x, frames_tensor, original_features, all_concepts, original_prominences, concept_extractor):
@@ -250,43 +291,64 @@ def objective_function(x, frames_tensor, original_features, all_concepts, origin
 # --- Training Loop ---
 def train(agent, concept_extractor, video_folder, num_episodes):
     optimizer = optim.Adam(agent.parameters(), lr=LEARNING_RATE)
-
+    user_annotations = pickle.load(open('/scratch3/kat049/STVT/STVT/STVT/datasets/datasets/datasets/ydata-tvsum50-v1_1/user_annotations.pkl',"rb"))
     for episode in range(num_episodes):
         video_files = [f for f in os.listdir(video_folder) if f.endswith(('.mp4', '.avi', '.mov'))]
         for video_file in video_files:
-            image_descriptions, frames = get_frame_features(video_folder, video_file, concept_extractor)
-            # all_concepts = list(all_concepts)  # Convert to list for indexing
-            num_frames = len(frames)
-            frames_tensor = torch.tensor(frames).to(f"{cuda}" if torch.cuda.is_available() else "cpu")  # Shape: (1, seq_len, 3, 224, 224)
-            with torch.no_grad():
-                prompt = [
-                    "USER: <video> Provide a factual description of this video. Avoid speculation or interpretation. ASSISTANT:"
-                ]
-                inputs = processor(text=prompt, videos=frames_tensor, padding=True, return_tensors="pt")
-                inputs = {k: v.to(cuda) for k, v in inputs.items()}
-                generate_ids = concept_extractor.generate(**inputs, max_new_tokens=500)
-                response = processor.batch_decode(generate_ids, skip_special_tokens=True, clean_up_tokenization_spaces=True)
-                assistant_responses = []
-                matches = re.findall(r"ASSISTANT:\s*(.+?)(?=(?:USER:|ASSISTANT:|$))", response[0], re.DOTALL)  # Improved regex
-                for match in matches:
-                    assistant_responses.append(match.strip())
-                
-                video_description = ", ".join(assistant_responses) # Extract concepts from the response
-                original_features = video_description
-                # original_features = concept_extractor(frames_tensor)  # Shape: (1, seq_len, num_concepts)
+            video_file_name = video_file.split('.')[0]
+            save_path = f"/scratch3/kat049/STVT/STVT/STVT/datasets/datasets/datasets/ydata-tvsum50-v1_1/image_video_captions/{video_file_name}_dictionary.pkl"
+            if os.path.exists(save_path):
+                f = pickle.load(open(save_path, "rb"))
+                image_descriptions = f['image_descriptions']
+                video_description = f['video_description']
+                timestamps = f['timestamps']  
+            else:
+                image_descriptions, frames, timestamps = get_frame_features(video_folder, video_file, concept_extractor)
+                # all_concepts = list(all_concepts)  # Convert to list for indexing
+                num_frames = len(frames)
+                frames_tensor = torch.tensor(frames).to(cuda if torch.cuda.is_available() else "cpu")  # Shape: (1, seq_len, 3, 224, 224)
+                with torch.no_grad():
+                    prompt = [
+                        "USER: <video> Provide a factual description of this video. Avoid speculation or interpretation. ASSISTANT:"
+                    ]
+                    inputs = processor(text=prompt, videos=frames_tensor, padding=True, return_tensors="pt")
+                    inputs = {k: v.to(cuda) for k, v in inputs.items()}
+                    generate_ids = concept_extractor.generate(**inputs, max_new_tokens=500)
+                    response = processor.batch_decode(generate_ids, skip_special_tokens=True, clean_up_tokenization_spaces=True)
+                    assistant_responses = []
+                    matches = re.findall(r"ASSISTANT:\s*(.+?)(?=(?:USER:|ASSISTANT:|$))", response[0], re.DOTALL)  # Improved regex
+                    for match in matches:
+                        assistant_responses.append(match.strip())
+                    
+                    video_description = ", ".join(assistant_responses) # Extract concepts from the response
+                    original_features = video_description
+                    # original_features = concept_extractor(frames_tensor)  # Shape: (1, seq_len, num_concepts)
 
-            dic = {
-                "image_descriptions": image_descriptions,
-                "video_description": video_description
-            }
-            with open('/scratch3/kat049/STVT/STVT/STVT/datasets/datasets/datasets/ydata-tvsum50-v1_1/RBCABdttQmI_dictionary.pkl', 'wb') as f:  # 'wb' for write binary
-                pickle.dump(dic, f)
+                dic = {
+                    "image_descriptions": image_descriptions,
+                    "video_description": video_description,
+                    "timestamps": timestamps,
+                }
+                with open(save_path, 'wb') as f:  # 'wb' for write binary
+                    pickle.dump(dic, f)
 
-            # Optimization
-            # [0, 25, 50, 75, 100, 125, 150, 175, 200, 225, 250, 275, 300, 325, 350]
-            f = pickle.load(open("/scratch3/kat049/STVT/STVT/STVT/datasets/datasets/datasets/ydata-tvsum50-v1_1/RBCABdttQmI_dictionary.pkl", "rb"))
-            image_descriptions = f['image_descriptions']
-            video_description = f['video_description']
+            ranked_tensors_sc, top_tensors_sc , ranked_tensors_sp, top_tensors_sp, ranked_tensors_qc, top_tensors_qc  = my_objective(image_descriptions, video_description)
+            
+            fps = 30  # Frames per second
+            frame_indices = [int(ts * fps) for ts in timestamps]  
+            annotations_at_timestamps = user_annotations[video_file_name].iloc[frame_indices]
+            frame_mean_values = annotations_at_timestamps['frame_mean']  
+            max_value = frame_mean_values.max()  
+            max_indices = frame_mean_values[frame_mean_values == max_value].index.tolist()
+
+            # plot for visualization
+            plot(max_indices, 
+                 [timestamps[sc]*fps for sc in top_tensors_sc], 
+                 [timestamps[sp]*fps for sp in top_tensors_sp], 
+                 [timestamps[qc]*fps for qc in top_tensors_qc],
+                 f'/scratch3/kat049/STVT/STVT/STVT/datasets/datasets/datasets/ydata-tvsum50-v1_1/images/{video_file_name}')
+
+
             num_frames = len(image_descriptions)
             initial_guess = np.zeros(num_frames)  # Start with no frames selected
             bounds = [(0, 1)] * num_frames  # Binary variables (0 or 1)
@@ -306,7 +368,7 @@ def train(agent, concept_extractor, video_folder, num_episodes):
                 frame_tensor = frames_tensor[:, t, :, :, :].unsqueeze(1)
                 with torch.no_grad():
                     frame_features = concept_extractor(frame_tensor)
-                state = create_state(frame_features, torch.stack(summary_features_list) if summary_features_list else torch.zeros(1,0,NUM_CONCEPTS).to(f"{cuda}" if torch.cuda.is_available() else "cpu")) #Provide empty tensor if no summary yet
+                state = create_state(frame_features, torch.stack(summary_features_list) if summary_features_list else torch.zeros(1,0,NUM_CONCEPTS).to(cuda if torch.cuda.is_available() else "cpu")) #Provide empty tensor if no summary yet
 
                 action_probs = agent(state)
                 action = torch.multinomial(action_probs, 1).item()  # Sample action
@@ -331,7 +393,7 @@ def train(agent, concept_extractor, video_folder, num_episodes):
                 sc = calculate_sc(current_concepts, all_concepts)
                 sp = calculate_sp(current_prominences, original_prominences)
                 qc = calculate_qc(current_concepts)
-                distance = calculate_distance(torch.stack(summary_features_list) if summary_features_list else torch.zeros(1,0,NUM_CONCEPTS).to(f"{cuda}" if torch.cuda.is_available() else "cpu"), original_features) # Distance to the entire original video
+                distance = calculate_distance(torch.stack(summary_features_list) if summary_features_list else torch.zeros(1,0,NUM_CONCEPTS).to(cuda if torch.cuda.is_available() else "cpu"), original_features) # Distance to the entire original video
 
                 reward = (METRIC_WEIGHTS["SC"] * sc +
                           METRIC_WEIGHTS["SP"] * sp +
@@ -351,5 +413,5 @@ def train(agent, concept_extractor, video_folder, num_episodes):
 # --- Initialize and Train ---
 input_dim = NUM_CONCEPTS * 2 # Input dimension to the agent (frame features + summary features)
 num_actions = 2  # Select or don't select
-agent = Agent(input_dim, num_actions).to(f"{cuda}" if torch.cuda.is_available() else "cpu")
+agent = Agent(input_dim, num_actions).to(cuda if torch.cuda.is_available() else "cpu")
 train(agent, ConceptExtractor, VIDEO_FOLDER, NUM_EPISODES)
