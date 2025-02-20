@@ -8,11 +8,11 @@ import cv2
 import numpy as np
 import os
 from collections import Counter, defaultdict
-from transformers import VideoLlavaProcessor, VideoLlavaForConditionalGeneration
 from moviepy.editor import VideoFileClip, concatenate_videoclips
 from PIL import Image
 import re
 import tqdm
+from transformers import VideoLlavaProcessor, VideoLlavaForConditionalGeneration
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from scipy.optimize import minimize  # For optimization
 import nltk
@@ -21,7 +21,7 @@ nltk.download('stopwords')
 
 from matplotlib import pyplot as plt
 import matplotlib.image as mpimg
-
+from objective_functions import compare_embeds
 import os
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
@@ -36,17 +36,7 @@ CONCEPT_EXTRACTION_MODEL_PATH = "path/to/your/concept_extraction_model.pth" # Pa
 VIDEO_FOLDER = "/scratch3/kat049/STVT/STVT/STVT/datasets/datasets/datasets/ydata-tvsum50-v1_1/video" # Path to the folder containing videos
 METRIC_WEIGHTS = {"SC": 0.4, "SP": 0.3, "QC": 0.2, "D": 0.1} # Weights for the metrics
 NUM_CONCEPTS = 1000 # Number of concepts (adjust to your model)
-
 cuda = "cuda:3"
-
-ConceptExtractor = VideoLlavaForConditionalGeneration.from_pretrained("LanguageBind/Video-LLaVA-7B-hf")
-ConceptExtractor.to(cuda)
-processor = VideoLlavaProcessor.from_pretrained("LanguageBind/Video-LLaVA-7B-hf")
-
-tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-2-13b-chat-hf")
-# llm_model = AutoModelForCausalLM.from_pretrained("meta-llama/Llama-2-13b-chat-hf", torch_dtype=torch.float16).to(cuda)
-
-stop_words = set(stopwords.words('english'))
 
 # # --- Concept Extraction (Replace with your actual model) ---
 # class ConceptExtractor(nn.Module):
@@ -167,6 +157,8 @@ def rank(overlaps, position=0):
     return ranked_tensors, top_tensors
 
 def get_image_captions(video, concept_extractor):
+    # tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-2-13b-chat-hf")
+    # llm_model = AutoModelForCausalLM.from_pretrained("meta-llama/Llama-2-13b-chat-hf", torch_dtype=torch.float16).to(cuda)
     prompt = [
         "USER: <image> Provide a list of concepts, separated by commas, present in the image. Avoid speculation or interpretation. The list can have one or many items. Pay attention to objects, colors, events etc. Describe as many concepts as you can. ASSISTANT:"
     ]
@@ -270,6 +262,7 @@ def plot_selected_images(video, video_name, timestamps):
     plt.close(fig)
 
 def my_objective(image_descriptions, video_description):
+    # stop_words = set(stopwords.words('english'))
     tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-2-13b-chat-hf")
     num_frames = len(image_descriptions)
     video_tokens = tokenizer(video_description, return_tensors="pt").to(cuda).input_ids[0].tolist()
@@ -313,60 +306,45 @@ def my_objective(image_descriptions, video_description):
 
     return ranked_tensors_sc, top_tensors_sc, ranked_tensors_iou, top_tensors_iou , ranked_tensors_sp, top_tensors_sp, ranked_tensors_qc, top_tensors_qc
 
-def extract_features(video):
-    for f in video.iter():
-        frame = video.get_frame(t)
-    pixel_values = processor(images=frames, return_tensors="pt").pixel_values.to(cuda)
-    with torch.no_grad(): # ensures no gradients are calculated which speeds up the process
-        outputs = ConceptExtractor(pixel_values=pixel_values)
-        embeddings = outputs.image_embeds # the embeddings
-
-
-
-    prompt = [
-        "USER: <image> Provide a factual description of this image. Avoid speculation or interpretation. ASSISTANT:"
-    ]
-    
+def extract_features(video, concept_extractor):
     frames = []
-    image_descriptions = []
-    all_concepts = set()
-    original_prominences = defaultdict(float)
+    mean_vectors = []
+    max_vectors = []
+    cls_vectors = []
 
     num_frames = 15
     interval = video.duration / num_frames
-
-    # Get timestamps at which to extract frames
     timestamps = [int(i * interval) for i in range(num_frames)]
+    
+    dummy_text = [""]  # Empty text input to satisfy the processor
 
-    # total_frames = int(video.duration)  # Number of seconds (since 1 fps)
-    #for i, frame in tqdm(enumerate(video.iter_frames(fps=1, dtype="uint8")), total=total_frames, desc="Extracting Frames"):
+    with torch.no_grad():
+        for i, t in tqdm.tqdm(enumerate(timestamps), total=len(timestamps), desc="Extracting Frames"):
+            frame = video.get_frame(t)
+            image = Image.fromarray(frame)
+            inputs = processor(images=image, text=dummy_text, return_tensors="pt")
+            
+            # vision_outputs = concept_extractor.image_tower(pixel_values=inputs['pixel_values_images'].to(cuda))
+            # last_hidden_state = vision_outputs.last_hidden_state
+            
+            image_output = concept_extractor.get_image_features(inputs['pixel_values_images'].to(cuda), -2, 'full') #'default'
+            mean_vector = image_output.mean(dim=1)  # Shape: [1, 4096]
+            max_vector = image_output.max(dim=1)[0]  # Shape: [1, 4096]
+            cls_vector = image_output[:, 0, :]  # Shape: [1, 4096]
+
+            frames.append(frame)
+            mean_vectors.append(mean_vector)
+            max_vectors.append(max_vector)
+            cls_vectors.append(cls_vector)
+
+        frames_tensor = torch.tensor(frames).to(cuda)  # Shape: (seq_len, height, width, 3)
+        inputs = processor(text=dummy_text, videos=frames_tensor, padding=True, return_tensors="pt")
+        video_output = concept_extractor.get_video_features(inputs['pixel_values_videos'].to(cuda), -2)[0]
         
-    for i, t in tqdm.tqdm(enumerate(timestamps), total=len(timestamps), desc="Extracting Frames"):
-        if i > 15:  # Limit to 15 frames
-            break
-        frame = video.get_frame(t)
-        frames.append(frame)
-        pil_image = Image.fromarray(frame)
-        inputs = processor(text=prompt, images=pil_image, padding=True, return_tensors="pt")
-        inputs = {k: v.to(cuda) for k, v in inputs.items()}
-        # Generate
-        generate_ids = concept_extractor.generate(**inputs, max_new_tokens=1000)
-        response = processor.batch_decode(generate_ids, skip_special_tokens=True, clean_up_tokenization_spaces=True)
-        
-        assistant_responses = []
-        matches = re.findall(r"ASSISTANT:\s*(.+?)(?=(?:USER:|ASSISTANT:|$))", response[0], re.DOTALL)  # Improved regex
-        for match in matches:
-            assistant_responses.append(match.strip())
-        
-        img_description = ", ".join(assistant_responses) # Extract concepts from the response
-        image_descriptions.append(img_description)
-    # Implement your feature extraction logic here.
-    # Options:
-    #   - Pre-trained CNN (e.g., ResNet, EfficientNet) to extract image features.
-    #   - Custom feature engineering (color histograms, edge descriptors, etc.).
-    # Input: List of frames (NumPy arrays).
-    # Output: Feature vector (NumPy array or PyTorch tensor).
-    pass
+        cls_tokens = video_output[:, 0, :]  # Shape: [15, 4096] - get CLS token from each frame
+        video_vector = cls_tokens.mean(dim=0)  # Shape: [4096] - mean across frames
+    
+    return video_vector, frames, mean_vectors, max_vectors, cls_vectors
 
 
 class KeyframeSelectionNetwork(torch.nn.Module):
@@ -521,7 +499,15 @@ def train(agent, concept_extractor, video_folder, num_episodes):
 # agent = Agent(input_dim, num_actions).to(cuda if torch.cuda.is_available() else "cpu")
 # train(agent, ConceptExtractor, VIDEO_FOLDER, NUM_EPISODES)
 
-video_files = [f for f in os.listdir(VIDEO_FOLDER) if f.endswith(('.mp4', '.avi', '.mov'))]
-for video_file in video_files:
-    video_path = os.path.join(VIDEO_FOLDER, video_file)
-    video = VideoFileClip(video_path)
+if __name__ == "__main__":
+    ConceptExtractor = VideoLlavaForConditionalGeneration.from_pretrained("LanguageBind/Video-LLaVA-7B-hf")
+    ConceptExtractor.to(cuda)
+    processor = VideoLlavaProcessor.from_pretrained("LanguageBind/Video-LLaVA-7B-hf")
+
+    video_files = [f for f in os.listdir(VIDEO_FOLDER) if f.endswith(('.mp4', '.avi', '.mov'))]
+    for video_file in video_files:
+        video_path = os.path.join(VIDEO_FOLDER, video_file)
+        video = VideoFileClip(video_path)
+        video_vector, frames, mean_vectors, max_vectors, cls_vectors = extract_features(video, ConceptExtractor)
+        print(compare_embeds(video_vector, torch.cat(cls_vectors)))
+        print("pause")
