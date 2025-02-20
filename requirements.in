@@ -1,0 +1,40 @@
+# torch
+# -e .
+# -e ".[train]"
+# # flash-attn
+# decord
+# opencv-python
+# git+https://github.com/facebookresearch/pytorchvideo.git@28fe037d212663c6a24f373b94cc5d478c8c1a1d
+# pip freeze | xargs pip uninstall -y to uninstall all
+# torch
+# transformers
+# tqdm
+# peft
+# einpos
+
+# python -m venv .venv_new
+# . .venv_new/bin/activate
+# module load rust/1.84.1 cuda/12.6.3 python/3.12.0 ffmpeg
+# pip install -U pip pip-tools
+# export PYTHONPATH=".:$PYTHONPATH"
+# pip-compile -U && pip-sync && python videollava/run_local_image_inference.py
+torch
+torchvision
+torchaudio
+git+https://github.com/facebookresearch/pytorchvideo.git  # No module named 'torchvision.transforms.functional_tensor'
+transformers<4.35.0  # issue with transformers clip _expand_mask
+einops
+peft<=0.10.0  # issue with transformers Cache
+huggingface-hub>=0.23.0
+#tokenizers>=0.20.0  # or export RUSTFLAGS="-A invalid_reference_casting"
+pillow
+opencv-python
+decord
+bitsandbytes
+sentencepiece
+protobuf
+scipy
+scikit-learn
+# have to install this after, don;t know why
+# pip install moviepy
+moviepy
