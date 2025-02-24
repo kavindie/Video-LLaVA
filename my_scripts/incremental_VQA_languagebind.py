@@ -6,7 +6,7 @@ import tqdm
 from moviepy import *
 from PIL import Image
 from scipy.optimize import minimize  # For optimization
-from objective_functions import compare_embeds, solve_with_lasso
+from objective_functions import compare_embeds, solve_with_lasso, DPP
 from languagebind import LanguageBind, to_device, transform_dict, LanguageBindImageTokenizer
 
 import os
@@ -66,8 +66,9 @@ class ClusterManager:
 
 
 class Incremental_VQA_LanguageBind():
-    def __init__(self, segment_size=8, overlap=1, device='cpu'):
+    def __init__(self, segment_size=8, overlap=1, device='cpu', train=True):
         self.device = device
+        self.train = train
         clip_type = {
             'video': 'LanguageBind_Video_FT',  # also LanguageBind_Video
             'audio': 'LanguageBind_Audio_FT',  # also LanguageBind_Audio
@@ -97,14 +98,16 @@ class Incremental_VQA_LanguageBind():
         self.frame_emebeddings = []
         self.segment_embeddings = []
 
-        self.cluster_manager_frames = ClusterManager()
-        self.cluster_manager_segments = ClusterManager()
+        # self.cluster_manager_frames = ClusterManager()
+        # self.cluster_manager_segments = ClusterManager()
 
         self.dummy_text = [""]
 
         self.learn_user_preferences = torch.nn.Sequential(
-            torch.nn.Linear(768, 1),
-        )
+            torch.nn.Linear(768, 768),
+        ).to(self.device)
+        torch.nn.init.eye_(self.learn_user_preferences[0].weight) # Access the Linear layer's weight
+        torch.nn.init.zeros_(self.learn_user_preferences[0].bias)
 
     def process_new_frame(self, frame):
         """frame: np.ndarray"""
@@ -116,11 +119,17 @@ class Incremental_VQA_LanguageBind():
         with torch.no_grad():
             embeddings = self.LanguageBindModel(inputs)
             
-            # forget what is not needed
-            full_embeddings = self.LanguageBindModel.modality_encoder['image'](inputs['image']['pixel_values'])[0]
-            self.cluster_manager_frames.add_tensor(full_embeddings)
+            # clustering 
+            # full_embeddings = self.LanguageBindModel.modality_encoder['image'](inputs['image']['pixel_values'])[0]
+            # self.cluster_manager_frames.add_tensor(full_embeddings)
 
-        self.frame_emebeddings.append(embeddings['image'][0])
+        if self.train:
+            embeddings = self.learn_user_preferences(embeddings['image'][0])
+        else:
+            with torch.no_grad():
+                embeddings = self.learn_user_preferences(embeddings['image'][0])
+
+        self.frame_emebeddings.append(embeddings)
         self.frames.append(frame)
 
 
@@ -143,16 +152,30 @@ class Incremental_VQA_LanguageBind():
         with torch.no_grad():
             embeddings = self.LanguageBindModel(inputs)
 
-            full_embeddings = self.LanguageBindModel.modality_encoder['video'](inputs['video']['pixel_values'])[0]
-            self.cluster_manager_segments.add_tensor(full_embeddings)
+            # forget what is not needed
+            # full_embeddings = self.LanguageBindModel.modality_encoder['video'](inputs['video']['pixel_values'])[0]
+            # self.cluster_manager_segments.add_tensor(full_embeddings)
+        if self.train:
+            embeddings = self.learn_user_preferences(embeddings['video'][0])
+        else:
+            with torch.no_grad():
+                embeddings = self.learn_user_preferences(embeddings['video'][0])
+        
             
-        self.segment_embeddings.append(embeddings['video'][0])
+        self.segment_embeddings.append(embeddings)
 
         if len(self.frames) == self.segment_size:
             self.frames = self.frames[-self.overlap:]
 
+    def loss(self, user_mask, mask):
+        FP = ((user_mask & ~mask).float()).mean()
+        TP = ((user_mask & mask).float()).mean()
+        FN = ((~user_mask & mask).float()).mean()
+        TN = ((~user_mask & ~mask).float()).mean()
+    
 
     def save_emebeddings(self, embeddings, path):
+        '/scratch3/kat049/STVT/STVT/STVT/datasets/datasets/datasets/ydata-tvsum50-v1_1/embeddings/languagebind_embs/{video_file_name}/frame_embs.pt'
         torch.save(embeddings, path)
 
     def answer_question(self, question, output_format='images', user_mask_frames=None, user_mask_segments=None):
@@ -167,10 +190,18 @@ class Incremental_VQA_LanguageBind():
         
         question_embedding  = question_embedding['language'][0]
 
-        frame_embeddings = torch.stack(self.frame_emebeddings)
-        segment_embeddings = torch.stack(self.segment_embeddings)
+        frame_embeddings = torch.stack(self.frame_emebeddings).detach()
+        segment_embeddings = torch.stack(self.segment_embeddings).detach()
 
         pdf, best_x = compare_embeds(question_embedding, segment_embeddings)
+
+        B = frame_embeddings*question_embedding
+        L = B@B.T
+        alpha = 1.5 / 31
+        dpp = FiniteDPP("likelihood", L=alpha*L.cpu())
+        dpp = DPP(segment_embeddings, question_embedding)
+
+
         pdf.argmax().item()
         mask = torch.tensor(best_x, dtype=torch.bool)  
         if output_format == 'video':
@@ -183,11 +214,15 @@ class Incremental_VQA_LanguageBind():
 
 def main():
     vqa = Incremental_VQA_LanguageBind(segment_size=SEGMENT_LENGTH, overlap=OVERLAP, device=device)
+
+    # criterion = torch.nn.CrossEntropyLoss()  # Loss function (for classification)
+    # optimizer = optim.Adam(model.parameters(), lr=0.001)  
+
     user_annotations = pickle.load(open('/scratch3/kat049/STVT/STVT/STVT/datasets/datasets/datasets/ydata-tvsum50-v1_1/user_annotations.pkl',"rb"))
     video_files = [f for f in os.listdir(VIDEO_FOLDER) if f.endswith(('.mp4', '.avi', '.mov'))]
-    for video_file in video_files:
-        if video_file != "sTEELN-vY30.mp4":
-            continue
+    for video_file in video_files:       
+        # if video_file != "sTEELN-vY30.mp4":
+        #     continue
         video_path = os.path.join(VIDEO_FOLDER, video_file)
         video = VideoFileClip(video_path)
         total_frames = int(video.duration)  # Number of seconds (since 1 fps)
