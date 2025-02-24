@@ -35,6 +35,8 @@ sentencepiece
 protobuf
 scipy
 scikit-learn
+pandas
+dppy
 # have to install this after, don;t know why
 # pip install moviepy
 moviepy
