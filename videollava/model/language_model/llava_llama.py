@@ -67,7 +67,7 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
         images: Optional[torch.FloatTensor] = None,
         return_dict: Optional[bool] = None,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
-
+        input_ids = input_ids.to(self.model.device) # kavi addition
         if inputs_embeds is None:
             (
                 input_ids,
