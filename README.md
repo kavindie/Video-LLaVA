@@ -365,3 +365,38 @@ If you find our paper and code useful in your research, please consider giving a
 </a>
 
 
+# My Additions
+## Installations
+```
+module load python/3.12.0
+module load cuda/11.8.0
+
+python3 -m venv .venv
+. .venv/bin/activate
+
+pip install --upgrade pip
+pip install pip-tools % was not useful
+pip3 install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
+pip install ipython transformers av protobuf sentencepiece
+
+# Load model directly from hugging face
+(https://huggingface.co/LanguageBind/Video-LLaVA-7B/discussions/5)
+
+from transformers import AutoProcessor, AutoModelForPreTraining
+
+processor = AutoProcessor.from_pretrained("LanguageBind/Video-LLaVA-7B-hf")
+model = AutoModelForPreTraining.from_pretrained("LanguageBind/Video-LLaVA-7B-hf")
+```
+
+model = VideoLlavaForConditionalGeneration.from_pretrained("LanguageBind/Video-LLaVA-7B-hf")
+processor = VideoLlavaProcessor.from_pretrained("LanguageBind/Video-LLaVA-7B-hf")
+Got downloaded to /scratch3/kat049/Video-LLaVA/.venv/lib/python3.12/site-packages
+'/home/kat049/.cache/huggingface/hub/datasets--raushan-testing-hf--videos-test/snapshots/655c9ae43a5a61f91aa3662d115c677b7d760d1e/sample_demo_1.mp4'
+
+To run the local 
+
+pip install einops peft moviepy==1.0.3
+
+Added parts for
+/scratch3/kat049/Video-LLaVA/.venv/lib/python3.12/site-packages/transformers/models/video_llava/modeling_video_llava.py
+Added with #TODO remove after
