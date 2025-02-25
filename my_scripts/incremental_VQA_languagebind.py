@@ -12,6 +12,8 @@ from pathlib import Path
 from matplotlib import pyplot as plt
 import math
 import torch.optim as optim
+from dppy.finite_dpps import FiniteDPP
+
 
 import os
 import pickle
@@ -103,7 +105,19 @@ class ClusterManager:
         return new_center
 
 
+class UserAdaptation(torch.nn.Module):
+    def __init__(self, input_size, device):
+        super(UserAdaptation, self).__init__()
+        self.device = device
+        self.linear = torch.nn.Linear(input_size, input_size).to(self.device)
+        torch.nn.init.eye_(self.linear.weight) # Access the Linear layer's weight
+        torch.nn.init.zeros_(self.linear.bias)
 
+    def forward(self, x):
+        W_sym = (self.linear.weight + self.linear.weight.t()) / 2
+        y = torch.matmul(x, W_sym.t()) + self.linear.bias # making sure this is symmetric
+        return y
+    
 class Incremental_VQA_LanguageBind():
     def __init__(self, segment_size=8, overlap=1, device='cpu', train=True):
         self.device = device
@@ -141,14 +155,9 @@ class Incremental_VQA_LanguageBind():
         # self.cluster_manager_segments = ClusterManager()
 
         self.dummy_text = [""]
-
-        self.learn_user_preferences = torch.nn.Sequential(
-            torch.nn.Linear(768, 768),
-        ).to(self.device)
-        torch.nn.init.eye_(self.learn_user_preferences[0].weight) # Access the Linear layer's weight
-        torch.nn.init.zeros_(self.learn_user_preferences[0].bias)
-
         self.lambda_param = 0.01
+
+        self.learn_user_preferences = UserAdaptation(input_size=768, device=self.device)
 
     def process_new_frame(self, frame):
         """frame: np.ndarray"""
@@ -158,7 +167,7 @@ class Incremental_VQA_LanguageBind():
         }        
 
         with torch.no_grad():
-            embeddings = self.LanguageBindModel(inputs)['image'][0]
+            embeddings = self.LanguageBindModel(inputs)['image'][0] # todo need to save this
             
             ## clustering 
             ## full_embeddings = self.LanguageBindModel.modality_encoder['image'](inputs['image']['pixel_values'])[0]
@@ -191,7 +200,7 @@ class Incremental_VQA_LanguageBind():
             'video': to_device(video_outputs_dict, self.device),
         }                
         with torch.no_grad():
-            embeddings = self.LanguageBindModel(inputs)['video'][0]
+            embeddings = self.LanguageBindModel(inputs)['video'][0] # todo need to save this
 
             ## clustering 
             ## full_embeddings = self.LanguageBindModel.modality_encoder['video'](inputs['video']['pixel_values'])[0]
@@ -215,39 +224,64 @@ class Incremental_VQA_LanguageBind():
         FN = ((~user_mask & mask).float()).mean()
         TN = ((~user_mask & ~mask).float()).mean()
     
-    def save_emebeddings(self, embeddings, path):
+    def save_emebeddings(self, embeddings):
         embeddings = torch.stack(embeddings).detach()
-        torch.save(embeddings, f'{path}/embeddings.pt')
+        torch.save(embeddings, f'{self.embed_saving_path}/embeddings.pt')
 
     def answer_question(self, question, video = None, video_reading_frequency = 1):
         # inputs can have , output_format='images', user_mask_frames=None, user_mask_segments=None
         # self.process_segment()
-
         language = question
         inputs = {}     
         inputs['language'] = to_device(self.tokenizer(language, max_length=77, padding='max_length',
                                                     truncation=True, return_tensors='pt'), self.device)
+        
+        with torch.no_grad():
+            embeddings = self.LanguageBindModel(inputs)['language'][0]
+        
         if self.train:
-            question_embedding = self.LanguageBindModel(inputs)['language'][0]
+            embeddings = self.learn_user_preferences(embeddings)
         else:
             with torch.no_grad():
-                question_embedding = self.LanguageBindModel(inputs)['language'][0]
+                embeddings = self.learn_user_preferences(embeddings)
         
+        question_embedding = embeddings
         frame_embeddings = torch.stack(self.frame_emebeddings)
         
-        pdf, best_x = compare_embeds(question_embedding.detach(), frame_embeddings.detach())
+        # pdf, best_x = compare_embeds(question_embedding.detach(), frame_embeddings.detach())
         # pdf.argmax().item()
         # mask = torch.tensor(best_x, dtype=torch.bool)  
 
-        B = frame_embeddings*question_embedding
+        # B = frame_embeddings*question_embedding
+        B = frame_embeddings * ( (frame_embeddings @ question_embedding) / (frame_embeddings.norm(dim=-1) * question_embedding.norm(dim=-1)) )[:,None]
+        L = B @ B.T
+        L = L.detach().cpu()
+        dpp = FiniteDPP("likelihood", L = self.lambda_param * L)
 
-        samples = DPP(B.detach(), self.lambda_param)
-        samples.sort()
+        def expected_num_frames(*, K=None, L=None):
+            if K is None: K = torch.linalg.solve(L + torch.eye(len(L)), L)
+            else: assert L is None
+            return K.trace()
+        print('expected_num_frames =', expected_num_frames(L=L*self.lambda_param))
+        samples = dpp.sample_exact()
+        print('actual   num frames =', len(samples))
+        plot_selections(video, video_reading_frequency, samples=samples, path='text.png')
+        return
+        max_prob = 0
+        selected_samples = None
+        for k in range(20):
+            samples = dpp.sample_exact()
+            prob = self.dpp_probability(B, samples)
+            if max_prob < prob:
+                max_prob = prob
+                selected_samples = samples
+        selected_samples.sort()
+
 
         if video is not None:
-            plot_selections(video, video_reading_frequency, samples=samples, path='text.png')
+            plot_selections(video, video_reading_frequency, samples=selected_samples, path='text.png')
         
-        return pdf.argmax().item(), best_x, samples, B
+        return selected_samples, B
         # segment_embeddings = torch.stack(self.segment_embeddings).detach()
         # if output_format == 'video':
         #     pass
@@ -266,7 +300,9 @@ class Incremental_VQA_LanguageBind():
             prob = torch.tensor(1e-6) # To prevent log(0)
         return prob
 
-
+def define_video_file_numbers():
+    order = ['AwmHb44_ouw', '98MoyGZKHXc', 'J0nA4VgnoCo', 'gzDbaEs1Rlg', 'XzYM3PfTM4w', 'HT5vyqe0Xaw', 'sTEELN-vY30', 'vdmoEJ5YbrQ', 'xwqBXPGE9pQ', 'akI8YFjEmUw', 'i3wAGJaaktw', 'Bhxk-O1Y7Ho', '0tmA_C6XwfM', '3eYKfiOEJNs', 'xxdtq8mxegs', 'WG0MBPpPC6I', 'Hl-__g2gn_A', 'Yi4Ij2NM7U4', '37rzWOQsNIw', 'LRw_obCPUt0', 'cjibtmSLxQ4', 'b626MiF1ew4', 'XkqCExn6_Us', 'GsAD1KT1xo8', 'PJrm840pAUI', '91IHQYk1IQM', 'RBCABdttQmI', 'z_6gVvQb2d0', 'fWutDQy1nnY', '4wU_LUjG5Ic', 'VuWGsYPqAX8', 'JKpqYvAdIsw', 'xmEERLqJ2kU', 'byxOvuiIJV0', '_xMr-HKMfVA', 'WxtbjNsCQ8A', 'uGu_10sucQo', 'EE-bNr36nyA', 'Se3oxnaPsz0', 'oDXZc0tZe04', 'qqR6AEXwxoQ', 'EYqVtI9YWJA', 'eQu1rNs0an0', 'JgHubY5Vw3Y', 'iVt07TCkFM0', 'E11zDS9XGzg', 'NyBmCxDoHJU', 'kLxoNp-UchI', 'jcoYJXDG9sw', '-esJrBWj2d8', ]
+    test_set_1 = [10,20,23,29,3,32,33,35,37,41]
 
 def main():
     vqa = Incremental_VQA_LanguageBind(segment_size=SEGMENT_LENGTH, overlap=OVERLAP, device=device, train=TRAIN)
@@ -274,10 +310,11 @@ def main():
     # criterion = torch.nn.CrossEntropyLoss()  # Loss function (for classification)
     optimizer = optim.Adam(vqa.learn_user_preferences.parameters(), lr=0.001)  
 
+    losses = []
     user_annotations = pickle.load(open('/scratch3/kat049/STVT/STVT/STVT/datasets/datasets/datasets/ydata-tvsum50-v1_1/user_annotations.pkl',"rb"))
     video_files = [f for f in os.listdir(VIDEO_FOLDER) if f.endswith(('.mp4', '.avi', '.mov'))]
     for video_file in video_files:
-        # if video_file != "sTEELN-vY30.mp4":
+        # if video_file != "WxtbjNsCQ8A.mp4": #"sTEELN-vY30.mp4":
         #     continue
         optimizer.zero_grad()
 
@@ -294,8 +331,6 @@ def main():
             vqa.process_new_frame(frame)
             timestamps.append(i)
 
-            if i > 20:
-                break
             # if i % 9 == 0 and i>0:
             #     vqa.answer_question("What is happening in this video?")
         
@@ -326,15 +361,17 @@ def main():
         # vqa.save_emebeddings(vqa.frame_emebeddings, path_frame_embeddings)
         # path_segment_embeddings = f'/scratch3/kat049/STVT/STVT/STVT/datasets/datasets/datasets/ydata-tvsum50-v1_1/embeddings/languagebind_embs/segments/{video_file_name}/{VIDEO_READING_FREQUENCY}_fps/{SEGMENT_LENGTH}_segment_{OVERLAP}_overlap'
         
-        pdf_max, best_x, dpp_samples, B = vqa.answer_question("What is happening in this video?", video, VIDEO_READING_FREQUENCY)
+        dpp_samples, B = vqa.answer_question("Describe the video", video, VIDEO_READING_FREQUENCY)
         prob = vqa.dpp_probability(B, dpp_samples)
         reward = get_user_feedback_annotated(frame_mean_values, dpp_samples)
         loss = -reward * torch.log(prob)
         loss.backward()
+        losses.append(loss.item())
         optimizer.step()
 
         video.close()
 
+    print("Done")
 
 if __name__ == "__main__":
     main()
