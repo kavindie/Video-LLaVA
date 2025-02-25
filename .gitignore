@@ -1,4 +1,8 @@
 .venv/
+.venv*/
 *.egg-info/
 __pycache__/
 .vscode/
+results/*
+cache_dir/
+my_scripts/s_tests/*
