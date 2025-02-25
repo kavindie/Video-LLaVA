@@ -74,7 +74,17 @@ def solve_with_lasso(A, y, alpha_range=None):
     return best_x, best_error, best_lambda
 
 
-def DPP(feature_embeddings, query_embedding, lambda_param=1.0):
+def DPP(B, lambda_param = 0.01):
+    L = B @ B.T
+    L = L.cpu()
+
+    dpp = FiniteDPP("likelihood", L = lambda_param * L)
+    return dpp.sample_exact()
+     
+
+
+
+
     """feature_embeddings - torch.tensor of shape [num_frames, embedding_dim]
        query_embedding - torch.tensor of shape [embedding_dim]"""
     # L matrix
