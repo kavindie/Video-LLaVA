@@ -25,11 +25,6 @@ VIDEO_FOLDER = "/scratch3/kat049/STVT/STVT/STVT/datasets/datasets/datasets/ydata
 
 device = "cuda:3"
 
-# use .venv
-# from transformers import VideoLlavaProcessor, VideoLlavaForConditionalGeneration
-# self.embedding_model = VideoLlavaForConditionalGeneration.from_pretrained("LanguageBind/Video-LLaVA-7B-hf")
-# self.processor = VideoLlavaProcessor.from_pretrained("LanguageBind/Video-LLaVA-7B-hf")
-
 
 # To use the video-llava. There is an error about the device
 # def get_model_output_updated(model, video_processor, tokenizer, video, qs, device):
@@ -80,6 +75,7 @@ device = "cuda:3"
 
 class Incremental_VQA_VideoLLaVA():
     def __init__(self, segment_size=8, overlap=1, device='cpu'):
+        self.device = device
         model_path = 'LanguageBind/Video-LLaVA-7B'
         model_base = None
         model_name = get_model_name_from_path(model_path)
@@ -87,13 +83,171 @@ class Incremental_VQA_VideoLLaVA():
         self.tokenizer, self.embedding_model, self.processor, context_len = load_pretrained_model(model_path, model_base, model_name)
         self.embedding_model = self.embedding_model.to(device)
         self.conv_mode = "llava_v1"
+
+        self.video_processor = self.processor['video']
+        self.image_processor = self.processor['image']
         
         # output = get_model_output_updated(model, processor['video'], tokenizer, video_path, question, device)
 
-        # with .venv
+        # with .venv and hf
         # self.embedding_model = VideoLlavaForConditionalGeneration.from_pretrained("LanguageBind/Video-LLaVA-7B-hf")
         # self.embedding_model.to(self.device)
-        # self.processor = VideoLlavaProcessor.from_pretrained("LanguageBind/Video-LLaVA-7B-hf")
+        # self.tokenizer = VideoLlavaProcessor.from_pretrained("LanguageBind/Video-LLaVA-7B-hf")
+
+        if segment_size > 8:
+            raise ValueError("Segment size should be less than or equal to 8")
+        self.segment_size = segment_size
+
+        if overlap > segment_size or overlap < 0:
+            raise ValueError("Overlap should be between 0 and segment_size")
+        self.overlap = overlap    
+
+        self.frames = []
+
+        self.frame_emebeddings = []
+        self.segment_embeddings = []
+
+        self.frame_full_emebeddings = []
+        self.segment_full_embeddings = []
+
+        self.dummy_text = [""]
+
+    def process_new_frame(self, frame, vector_creation="mean"):
+        """frame: np.ndarray"""
+        inp = self.dummy_text[0]
+        conv = conv_templates[self.conv_mode].copy()
+        roles = conv.roles
+
+        image_tensor = self.image_processor.preprocess(frame, return_tensors='pt')['pixel_values']
+        if type(image_tensor) is list:
+            image_tensor = [image.to(self.device, dtype=torch.float16) for image in image_tensor]
+        else:
+            image_tensor = image_tensor.to(self.device, dtype=torch.float16)
+
+        with torch.no_grad():
+            image_embedding = self.embedding_model.encode_images(image_tensor)
+
+        self.frame_full_emebeddings.append(image_embedding)
+
+        if vector_creation == 'mean':
+            image_embedding = image_embedding.mean(dim=0)
+        elif vector_creation == 'max':
+            image_embedding = image_embedding.max(dim=0)[0]
+        else:
+            raise ValueError("vector_creation should be one of 'mean', 'max'")
+        
+        self.frame_emebeddings.append(image_embedding)
+        self.frames.append(frame)
+
+        if len(self.frames) == self.segment_size:
+            self.process_segment()
+            self.frames = self.frames[-self.overlap:]
+
+        # print(f"{roles[1]}: {inp}")
+        # inp = DEFAULT_IMAGE_TOKEN + '\n' + inp #'<image>\n'
+        # conv.append_message(conv.roles[0], inp)
+        # conv.append_message(conv.roles[1], None)
+        # prompt = conv.get_prompt()
+        # input_ids = tokenizer_image_token(prompt, self.tokenizer, IMAGE_TOKEN_INDEX, return_tensors='pt').unsqueeze(0).to(device)
+        # stop_str = conv.sep if conv.sep_style != SeparatorStyle.TWO else conv.sep2
+        # keywords = [stop_str]
+        # stopping_criteria = KeywordsStoppingCriteria(keywords, self.tokenizer, input_ids)
+
+        # with torch.inference_mode():
+        #     output_ids = self.embedding_model.generate(
+        #         input_ids,
+        #         images=tensor,
+        #         do_sample=True,
+        #         temperature=0.2,
+        #         max_new_tokens=1024,
+        #         use_cache=True,
+        #         stopping_criteria=[stopping_criteria])
+
+        # outputs = self.tokenizer.decode(output_ids[0, input_ids.shape[1]:]).strip()
+        # print(outputs)
+
+
+    def process_segment(self, vector_creation="cls_mean"):
+        frames_tensor = torch.tensor(self.frames).to(self.device)  # Shape: (T, H, W, C)
+
+        transform = self.video_processor.preprocess.transform
+        video_data = frames_tensor.permute(3, 0, 1, 2)  # (T, H, W, C) -> (C, T, H, W)
+        video_outputs = transform(video_data)
+        video_tensor = video_outputs.half().to(self.device) # need a video path
+
+
+        with torch.no_grad():
+            video_embedding = self.embedding_model.encode_videos(video_tensor)  # [mini_b, c, t, h, w] 
+
+        self.segment_full_embeddings.append(video_embedding)
+
+        if vector_creation == 'cls_mean':
+            cls_tokens = video_embedding[:, 0, :]  # Shape: [15, 4096] - get CLS token from each frame
+            video_vector = cls_tokens.mean(dim=0)  # Shape: [4096] - mean across frames
+        elif vector_creation == 'mean':
+            video_vector = video_embedding.mean(dim=[0, 1]) 
+        else:
+            raise ValueError("vector_creation should be one of 'cls_mean', 'mean'")
+
+        self.segment_embeddings.append(video_vector)
+
+        if len(self.frames) == self.segment_size:
+            self.frames = self.frames[-self.overlap:]
+
+
+    def save_emebeddings(self, embeddings, path):
+        torch.save(embeddings, path)
+
+    def answer_question(self, question):
+        frame_embeddings = torch.cat(self.frame_emebeddings)
+        segment_embeddings = torch.cat(self.segment_embeddings)
+        question_embedding = self.tokenizer(text=question, padding=True, return_tensors="pt")
+
+        self.embedding_model.language_model.get_input_embeddings()
+
+        inputs = {k: v.to(device) for k, v in question_embedding.items()}
+        generate_ids = self.embedding_model.generate(**inputs, max_new_tokens=200)
+
+
+        pdf, best_x = compare_embeds(self.segment_embeddings[0], frame_embeddings)
+        pdf.argmax().item()
+        mask = torch.tensor(best_x, dtype=torch.bool)  
+        
+
+        self.process_segment()
+
+        # TODO answer the question
+        pass
+
+def main():
+    vqa = Incremental_VQA_VideoLLaVA(device=device)
+    video_files = [f for f in os.listdir(VIDEO_FOLDER) if f.endswith(('.mp4', '.avi', '.mov'))]
+    for video_file in video_files:
+        video_path = os.path.join(VIDEO_FOLDER, video_file)
+        video = VideoFileClip(video_path)
+        total_frames = int(video.duration)  # Number of seconds (since 1 fps)
+        for i, frame in tqdm.tqdm(enumerate(video.iter_frames(fps=1, dtype="uint8")), total=total_frames, desc="Extracting Frames"):
+            vqa.process_new_frame(frame)
+            if i % 9 == 0 and i>0:
+                vqa.answer_question("What is happening in this video?")
+
+        video.close()
+
+
+if __name__ == "__main__":
+    main()
+
+
+# use .venv
+# from transformers import VideoLlavaProcessor, VideoLlavaForConditionalGeneration
+# self.embedding_model = VideoLlavaForConditionalGeneration.from_pretrained("LanguageBind/Video-LLaVA-7B-hf")
+# self.tokenizer = VideoLlavaProcessor.from_pretrained("LanguageBind/Video-LLaVA-7B-hf")
+class Incremental_VQA_VideoLLaVA_HF():
+    def __init__(self, segment_size=8, overlap=1, device='cpu'):
+        # with .venv and hf
+        self.embedding_model = VideoLlavaForConditionalGeneration.from_pretrained("LanguageBind/Video-LLaVA-7B-hf")
+        self.embedding_model.to(self.device)
+        self.tokenizer = VideoLlavaProcessor.from_pretrained("LanguageBind/Video-LLaVA-7B-hf")
 
         if segment_size > 8:
             raise ValueError("Segment size should be less than or equal to 8")
@@ -115,11 +269,9 @@ class Incremental_VQA_VideoLLaVA():
 
     def process_new_frame(self, frame, vector_creation="CLS"):
         """frame: np.ndarray"""
-
-
         with torch.no_grad():
             image = Image.fromarray(frame)
-            inputs = self.processor(images=image, text=self.dummy_text, return_tensors="pt")
+            inputs = self.tokenizer(images=image, text=self.dummy_text, return_tensors="pt")
             
             image_output = self.embedding_model.get_image_features(inputs['pixel_values_images'].to(self.device), -2, 'full')  # after the multimodal projection
 
@@ -145,7 +297,7 @@ class Incremental_VQA_VideoLLaVA():
     def process_segment(self, vector_creation="cls_mean"):
         with torch.no_grad():
             frames_tensor = torch.tensor(self.frames).to(self.device)  # Shape: (seq_len, height, width, 3)
-            inputs = self.processor(text=self.dummy_text, videos=frames_tensor, padding=True, return_tensors="pt")
+            inputs = self.tokenizer(text=self.dummy_text, videos=frames_tensor, padding=True, return_tensors="pt")
             video_output = self.embedding_model.get_video_features(inputs['pixel_values_videos'].to(self.device), -2)[0] #mutlimodal projection
             
             self.segment_full_embeddings.append(video_output)
@@ -170,7 +322,7 @@ class Incremental_VQA_VideoLLaVA():
     def answer_question(self, question):
         frame_embeddings = torch.cat(self.frame_emebeddings)
         segment_embeddings = torch.cat(self.segment_embeddings)
-        question_embedding = self.processor(text=question, padding=True, return_tensors="pt")
+        question_embedding = self.tokenizer(text=question, padding=True, return_tensors="pt")
 
         self.embedding_model.language_model.get_input_embeddings()
 
@@ -187,7 +339,7 @@ class Incremental_VQA_VideoLLaVA():
         #     sample = sample.replace(self.video_token, self.video_token * num_video_tokens)
         #     prompt_strings.append(sample)
         # prompt_strings = [question]
-        # text_inputs = self.processor.tokenizer(
+        # text_inputs = self.tokenizer.tokenizer(
         #     prompt_strings,
         #     return_tensors=return_tensors,
         #     padding=padding,
@@ -259,22 +411,4 @@ class Incremental_VQA_VideoLLaVA():
         # TODO answer the question
         pass
 
-def main():
-    vqa = Incremental_VQA_VideoLLaVA(device=device)
-
-    video_files = [f for f in os.listdir(VIDEO_FOLDER) if f.endswith(('.mp4', '.avi', '.mov'))]
-    for video_file in video_files:
-        video_path = os.path.join(VIDEO_FOLDER, video_file)
-        video = VideoFileClip(video_path)
-        total_frames = int(video.duration)  # Number of seconds (since 1 fps)
-        for i, frame in tqdm.tqdm(enumerate(video.iter_frames(fps=1, dtype="uint8")), total=total_frames, desc="Extracting Frames"):
-            vqa.process_new_frame(frame)
-            if i % 9 == 0 and i>0:
-                vqa.answer_question("What is happening in this video?")
-
-        video.close()
-
-
-if __name__ == "__main__":
-    main()
 
