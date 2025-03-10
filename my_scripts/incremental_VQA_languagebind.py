@@ -60,7 +60,18 @@ def get_user_feedback_annotated(frame_mean_values, samples):
     else:
         return -1.0 # thumps down
 
-    
+def kernel(frame_embeddings, question_embedding):
+    diff = frame_embeddings - question_embedding
+    number_of_frames = diff.shape[0]
+    L = torch.zeros((number_of_frames, number_of_frames))
+    for i in range(number_of_frames):
+        for j in range(number_of_frames):
+            L[i,j] = (diff[i] @ diff[j].T) / ((diff[i]**2).sum() * (diff[j]**2).sum())
+    diff2 = torch.sum(diff**2, dim=-1)
+    L_prev = (diff @ diff.T) / (diff2 * diff2[:,None])
+    L_new = (diff @ diff.T) / (torch.sqrt(torch.sum(diff**2, dim=1, keepdim=True)) @ torch.sqrt(torch.sum(diff**2, dim=1, keepdim=True)).T)
+
+
 class ClusterManager:
     def __init__(self, threshold=0.3):  # Threshold is weird
         self.clusters = []  # List of cluster centers (tensors)
@@ -252,8 +263,9 @@ class Incremental_VQA_LanguageBind():
         # pdf.argmax().item()
         # mask = torch.tensor(best_x, dtype=torch.bool)  
 
+        
         # B = frame_embeddings*question_embedding
-        B = frame_embeddings * ( (frame_embeddings @ question_embedding) / (frame_embeddings.norm(dim=-1) * question_embedding.norm(dim=-1)) )[:,None]
+        B = frame_embeddings * (0.5+ 0.5*(frame_embeddings @ question_embedding) / (frame_embeddings.norm(dim=-1) * question_embedding.norm(dim=-1)) )[:,None]
         L = B @ B.T
         L = L.detach().cpu()
         dpp = FiniteDPP("likelihood", L = self.lambda_param * L)
