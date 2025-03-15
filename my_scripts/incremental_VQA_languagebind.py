@@ -13,7 +13,8 @@ from matplotlib import pyplot as plt
 import math
 import torch.optim as optim
 from dppy.finite_dpps import FiniteDPP
-
+import gradio as gr
+import time
 
 import os
 import pickle
@@ -78,18 +79,18 @@ def kernel_diff(frame_embeddings, question_embedding):
 
 def kernel_simple(frame_embeddings, question_embedding):
     """Args:
-        image_embeddings: Tensor of shape [n_images, 768]
-        query_embedding: Tensor of shape [768]"""
+        frame_embeddings: Tensor of shape [n_images, 768]
+        question_embedding: Tensor of shape [768]"""
     
     # Normalize embeddings
-    image_embeddings = torch.nn.functional.normalize(frame_embeddings, dim=1)
-    query_embedding = torch.nn.functional.normalize(question_embedding, dim=0)
+    frame_embeddings = torch.nn.functional.normalize(frame_embeddings, dim=1)
+    question_embedding = torch.nn.functional.normalize(question_embedding, dim=0)
 
     # Calculate quality scores (relevance to query)
-    quality_scores = image_embeddings @ query_embedding
+    quality_scores = frame_embeddings @ question_embedding
     
     # Compute similarity matrix
-    similarity = image_embeddings @ image_embeddings.T
+    similarity = frame_embeddings @ frame_embeddings.T
 
     # Create the L-ensemble kernel: L(i,j) = q_i * q_j * S(i,j)
     L_kernel = quality_scores[:, None] * quality_scores[None, :] * similarity
@@ -203,7 +204,7 @@ class Incremental_VQA_LanguageBind():
         self.dummy_text = [""]
         self.lambda_param = 0.01
 
-        self.learn_user_preferences = UserAdaptation(input_size=768, device=self.device)
+        self.learn_user_preferences = UserAdaptation(input_size=768, output_size=100, device=self.device)
 
     def process_new_frame(self, frame):
         """frame: np.ndarray"""
@@ -272,7 +273,12 @@ class Incremental_VQA_LanguageBind():
     
     def DPP_loss(K, sampled_set, mask):
         D_selected, D_ignored = get_user_feedback(samples=sampled_set, mask=mask)
-        p_selected_in_sampled = K[D_selected,:][:,D_selected]
+        logprob_selected_in_sampled = K[D_selected,:][:,D_selected].logdet()
+        logprob_selected_i_in_samples = 0
+        for i in D_ignored:
+            D_selected_i = torch.concat([D_selected, torch.tensor([i])])
+            logprob_selected_i_in_samples += D_selected_i.logdet()
+        return -logprob_selected_in_sampled*(len(D_ignored)+1) + logprob_selected_i_in_samples
 
     def save_emebeddings(self, embeddings):
         embeddings = torch.stack(embeddings).detach()
@@ -307,18 +313,24 @@ class Incremental_VQA_LanguageBind():
         # B = frame_embeddings * (0.5+ 0.5*(frame_embeddings @ question_embedding) / (frame_embeddings.norm(dim=-1) * question_embedding.norm(dim=-1)) )[:,None]
         # L = B @ B.T
         L = kernel_simple(frame_embeddings, question_embedding)
-        L = L.detach().cpu()
-
-        self.lambda_param = 1 / L.diag().max()
-        
-        dpp = FiniteDPP("likelihood", L = self.lambda_param * L)
-
-        print('expected_num_frames =', expected_num_frames(L=L*self.lambda_param))
-        samples = dpp.sample_exact()
+        L_norm = L / L.diag().max()        
+        dpp = FiniteDPP("likelihood", L = L_norm.detach().cpu())
+        print('expected_num_frames =', expected_num_frames(L = L_norm))
+        while True:
+            try:
+                samples = dpp.sample_exact()
+                break
+            except ValueError as e:
+                print(e)
+            print("...trying again...")
         print('actual   num frames =', len(samples))
         samples.sort()
-        plot_selections(video, video_reading_frequency, samples=samples, path='text.png')
-        return
+        if video is not None:
+            plot_selections(video, VIDEO_READING_FREQUENCY, samples=samples, path='text.png')
+
+        return samples, L
+    
+
         max_prob = 0
         selected_samples = None
         for k in range(20):
@@ -341,8 +353,7 @@ class Incremental_VQA_LanguageBind():
         # elif output_format == 'images':
         #     pdf, best_x = compare_embeds(question_embedding, frame_embeddings) 
 
-    def dpp_probability(self, B, samples):
-        L = B @ B.T
+    def dpp_probability(self, L, samples):
         L = self.lambda_param * L
         L_S = L[samples, :][:, samples] # Extract submatrix
         try:
@@ -413,8 +424,9 @@ def TVSum_folder():
         # vqa.save_emebeddings(vqa.frame_emebeddings, path_frame_embeddings)
         # path_segment_embeddings = f'/scratch3/kat049/STVT/STVT/STVT/datasets/datasets/datasets/ydata-tvsum50-v1_1/embeddings/languagebind_embs/segments/{video_file_name}/{VIDEO_READING_FREQUENCY}_fps/{SEGMENT_LENGTH}_segment_{OVERLAP}_overlap'
         
-        dpp_samples, B = vqa.answer_question("Person", video, VIDEO_READING_FREQUENCY)
-        prob = vqa.dpp_probability(B, dpp_samples)
+        dpp_samples, L = vqa.answer_question("Person", video, VIDEO_READING_FREQUENCY)
+        # plot_selections(video, VIDEO_READING_FREQUENCY, samples=dpp_samples, path='text.png')
+        prob = vqa.dpp_probability(L, dpp_samples)
         reward = get_user_feedback_annotated(frame_mean_values, dpp_samples)
         loss = -reward * torch.log(prob)
         loss.backward()
@@ -425,7 +437,7 @@ def TVSum_folder():
 
     print("Done")
 
-def main():
+def DARPA_folder():
     vqa = Incremental_VQA_LanguageBind(segment_size=SEGMENT_LENGTH, overlap=OVERLAP, device=device, train=TRAIN)
 
     video_path =  '/scratch3/kat049/user_studies/vids/p17_fr.mp4'
