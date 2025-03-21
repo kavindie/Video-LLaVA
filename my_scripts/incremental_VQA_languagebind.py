@@ -15,9 +15,11 @@ import torch.optim as optim
 from dppy.finite_dpps import FiniteDPP
 import gradio as gr
 import time
+import numpy as np
 
 import os
 import pickle
+import pandas as pd
 
 
 SEGMENT_LENGTH = 8  # Segement length in frames
@@ -156,9 +158,9 @@ class UserAdaptation(torch.nn.Module):
         super(UserAdaptation, self).__init__()
         self.device = device
         self.linear = torch.nn.Linear(input_size, output_size).to(self.device)
-        # torch.nn.init.eye_(self.linear.weight) # Access the Linear layer's weight
-        # torch.nn.init.zeros_(self.linear.bias)
-
+        if output_size == input_size:
+            torch.nn.init.eye_(self.linear.weight)
+            torch.nn.init.zeros_(self.linear.bias)
     def forward(self, x):
         # W_sym = (self.linear.weight + self.linear.weight.t()) / 2
         # y = torch.matmul(x, W_sym.t()) + self.linear.bias # making sure this is symmetric
@@ -166,7 +168,7 @@ class UserAdaptation(torch.nn.Module):
         return y
     
 class Incremental_VQA_LanguageBind():
-    def __init__(self, segment_size=8, overlap=1, device='cpu', train=True):
+    def __init__(self, segment_size=8, overlap=1, device='cpu', train=True, trained_output_size=None):
         self.device = device
         self.train = train
         clip_type = {
@@ -191,11 +193,11 @@ class Incremental_VQA_LanguageBind():
 
         if overlap > segment_size or overlap < 0:
             raise ValueError("Overlap should be between 0 and segment_size")
-        self.overlap = overlap    
+        self.overlap = overlap
 
         self.frames = []
 
-        self.frame_emebeddings = []
+        self.frame_embeddings = []
         self.segment_embeddings = []
 
         # self.cluster_manager_frames = ClusterManager()
@@ -204,7 +206,9 @@ class Incremental_VQA_LanguageBind():
         self.dummy_text = [""]
         self.lambda_param = 0.01
 
-        self.learn_user_preferences = UserAdaptation(input_size=768, output_size=100, device=self.device)
+        if trained_output_size is None:
+            trained_output_size = 768
+        self.learn_user_preferences = UserAdaptation(input_size=768, output_size=trained_output_size, device=self.device)
 
     def process_new_frame(self, frame):
         """frame: np.ndarray"""
@@ -214,8 +218,7 @@ class Incremental_VQA_LanguageBind():
         }        
 
         with torch.no_grad():
-            embeddings = self.LanguageBindModel(inputs)['image'][0] # todo need to save this
-            
+            embeddings = self.LanguageBindModel(inputs)['image'][0] # todo need to save this  
             ## clustering 
             ## full_embeddings = self.LanguageBindModel.modality_encoder['image'](inputs['image']['pixel_values'])[0]
             ## self.cluster_manager_frames.add_tensor(full_embeddings)
@@ -226,16 +229,17 @@ class Incremental_VQA_LanguageBind():
             with torch.no_grad():
                 embeddings = self.learn_user_preferences(embeddings)
 
-        self.frame_emebeddings.append(embeddings)
+        self.frame_embeddings.append(embeddings)
         self.frames.append(frame)
-
 
         if len(self.frames) == self.segment_size:
             self.process_segment()
-            self.frames = self.frames[-self.overlap:]
+            self.frames = [] if self.overlap == 0 else self.frames[-self.overlap:]
 
     def process_segment(self):
-        frames_tensor = torch.tensor(self.frames).to(self.device)  # Shape: (seq_len, height, width, 3)
+        # frames_tensor = torch.stack(self.frames).to(self.device)  # Shape: (seq_len, height, width, 3)
+        frames_tensor = torch.tensor(np.array(self.frames)).to(self.device)  # Shape: (seq_len, height, width, 3)
+        # print("frames_tensor.shape", frames_tensor.shape)
         inputs= {}
 
         transform = self.modality_transform['video'].transform
@@ -262,8 +266,8 @@ class Incremental_VQA_LanguageBind():
             
         self.segment_embeddings.append(embeddings)
 
-        if len(self.frames) == self.segment_size:
-            self.frames = self.frames[-self.overlap:]
+        # if len(self.frames) == self.segment_size:
+        #     self.frames = [] if self.overlap == 0 else self.frames[-self.overlap:]
 
     # def loss(self, user_mask, mask):
     #     FP = ((user_mask & ~mask).float()).mean()
@@ -280,11 +284,7 @@ class Incremental_VQA_LanguageBind():
             logprob_selected_i_in_samples += D_selected_i.logdet()
         return -logprob_selected_in_sampled*(len(D_ignored)+1) + logprob_selected_i_in_samples
 
-    def save_emebeddings(self, embeddings):
-        embeddings = torch.stack(embeddings).detach()
-        torch.save(embeddings, f'{self.embed_saving_path}/embeddings.pt')
-
-    def answer_question(self, question, video = None, video_reading_frequency = 1):
+    def answer_question(self, question, video = None, video_reading_frequency = 1, output='images'):
         # inputs can have , output_format='images', user_mask_frames=None, user_mask_segments=None
         # self.process_segment()
         language = question
@@ -302,17 +302,20 @@ class Incremental_VQA_LanguageBind():
                 embeddings = self.learn_user_preferences(embeddings)
         
         question_embedding = embeddings
-        frame_embeddings = torch.stack(self.frame_emebeddings)
+        if output == 'images':
+            vision_embeddings = torch.stack(self.frame_embeddings)
+        else:
+            vision_embeddings = torch.stack(self.segment_embeddings)
         
-        # pdf, best_x = compare_embeds(question_embedding.detach(), frame_embeddings.detach())
+        # pdf, best_x = compare_embeds(question_embedding.detach(), vision_embeddings.detach())
         # pdf.argmax().item()
         # mask = torch.tensor(best_x, dtype=torch.bool)  
 
         
-        # B = frame_embeddings*question_embedding
-        # B = frame_embeddings * (0.5+ 0.5*(frame_embeddings @ question_embedding) / (frame_embeddings.norm(dim=-1) * question_embedding.norm(dim=-1)) )[:,None]
+        # B = vision_embeddings*question_embedding
+        # B = vision_embeddings * (0.5+ 0.5*(vision_embeddings @ question_embedding) / (vision_embeddings.norm(dim=-1) * question_embedding.norm(dim=-1)) )[:,None]
         # L = B @ B.T
-        L = kernel_simple(frame_embeddings, question_embedding)
+        L = kernel_simple(vision_embeddings, question_embedding)
         L_norm = L / L.diag().max()        
         dpp = FiniteDPP("likelihood", L = L_norm.detach().cpu())
         print('expected_num_frames =', expected_num_frames(L = L_norm))
@@ -326,7 +329,8 @@ class Incremental_VQA_LanguageBind():
         print('actual   num frames =', len(samples))
         samples.sort()
         if video is not None:
-            plot_selections(video, VIDEO_READING_FREQUENCY, samples=samples, path='text.png')
+            if output == 'images':
+                plot_selections(video, VIDEO_READING_FREQUENCY, samples=samples, path='text.png')
 
         return samples, L
     
@@ -363,11 +367,15 @@ class Incremental_VQA_LanguageBind():
             prob = torch.tensor(1e-6) # To prevent log(0)
         return prob
 
+def save_emebeddings(embeddings, embedding_saving_path):
+    embeddings = torch.stack(embeddings).detach()
+    torch.save(embeddings, embedding_saving_path)
+
 def define_video_file_numbers():
     order = ['AwmHb44_ouw', '98MoyGZKHXc', 'J0nA4VgnoCo', 'gzDbaEs1Rlg', 'XzYM3PfTM4w', 'HT5vyqe0Xaw', 'sTEELN-vY30', 'vdmoEJ5YbrQ', 'xwqBXPGE9pQ', 'akI8YFjEmUw', 'i3wAGJaaktw', 'Bhxk-O1Y7Ho', '0tmA_C6XwfM', '3eYKfiOEJNs', 'xxdtq8mxegs', 'WG0MBPpPC6I', 'Hl-__g2gn_A', 'Yi4Ij2NM7U4', '37rzWOQsNIw', 'LRw_obCPUt0', 'cjibtmSLxQ4', 'b626MiF1ew4', 'XkqCExn6_Us', 'GsAD1KT1xo8', 'PJrm840pAUI', '91IHQYk1IQM', 'RBCABdttQmI', 'z_6gVvQb2d0', 'fWutDQy1nnY', '4wU_LUjG5Ic', 'VuWGsYPqAX8', 'JKpqYvAdIsw', 'xmEERLqJ2kU', 'byxOvuiIJV0', '_xMr-HKMfVA', 'WxtbjNsCQ8A', 'uGu_10sucQo', 'EE-bNr36nyA', 'Se3oxnaPsz0', 'oDXZc0tZe04', 'qqR6AEXwxoQ', 'EYqVtI9YWJA', 'eQu1rNs0an0', 'JgHubY5Vw3Y', 'iVt07TCkFM0', 'E11zDS9XGzg', 'NyBmCxDoHJU', 'kLxoNp-UchI', 'jcoYJXDG9sw', '-esJrBWj2d8', ]
     test_set_1 = [10,20,23,29,3,32,33,35,37,41]
 
-def TVSum_folder():
+def TVSum_folder(video_reading_frequency=VIDEO_READING_FREQUENCY):
     vqa = Incremental_VQA_LanguageBind(segment_size=SEGMENT_LENGTH, overlap=OVERLAP, device=device, train=TRAIN)
 
     # For generic video data folders
@@ -380,17 +388,15 @@ def TVSum_folder():
         if video_file != "sTEELN-vY30.mp4": #"sTEELN-vY30.mp4":
             continue
         optimizer.zero_grad()
-
-
         video_path = os.path.join(VIDEO_FOLDER, video_file)
         video = VideoFileClip(video_path)
-        total_frames = int(video.duration)  # Number of seconds (since 1 fps)
+        total_frames = int(video.duration)*video_reading_frequency  # Number of seconds (since 1 fps)
         
         fps = video.fps  # Frames per second
         video_file_name = video_file.split('.')[0]
         timestamps = []
         
-        for i, frame in tqdm.tqdm(enumerate(video.iter_frames(fps=VIDEO_READING_FREQUENCY, dtype="uint8")), total=total_frames, desc="Extracting Frames"):
+        for i, frame in tqdm.tqdm(enumerate(video.iter_frames(fps=video_reading_frequency, dtype="uint8")), total=total_frames, desc="Extracting Frames"):
             vqa.process_new_frame(frame)
             timestamps.append(i)
 
@@ -411,7 +417,7 @@ def TVSum_folder():
         mask_segments = torch.zeros(num_segments, dtype=torch.bool)
         start = 0
         for i in range(num_segments):
-            end = min(start + SEGMENT_LENGTH, len(vqa.frame_emebeddings))  # Handle edge cases where the last segment is smaller
+            end = min(start + SEGMENT_LENGTH, len(vqa.frame_embeddings))  # Handle edge cases where the last segment is smaller
             segment = mask_frames[start:end]
             num_true = segment.sum()
             num_false = segment.shape[0] - num_true
@@ -421,11 +427,11 @@ def TVSum_folder():
 
         # path_frame_embeddings = f'/scratch3/kat049/STVT/STVT/STVT/datasets/datasets/datasets/ydata-tvsum50-v1_1/embeddings/languagebind_embs/frames/{video_file_name}/{VIDEO_READING_FREQUENCY}_fps'
         # Path(path_frame_embeddings).mkdir(parents=True, exist_ok=True)
-        # vqa.save_emebeddings(vqa.frame_emebeddings, path_frame_embeddings)
+        # vqa.save_emebeddings(vqa.frame_embeddings, path_frame_embeddings)
         # path_segment_embeddings = f'/scratch3/kat049/STVT/STVT/STVT/datasets/datasets/datasets/ydata-tvsum50-v1_1/embeddings/languagebind_embs/segments/{video_file_name}/{VIDEO_READING_FREQUENCY}_fps/{SEGMENT_LENGTH}_segment_{OVERLAP}_overlap'
         
-        dpp_samples, L = vqa.answer_question("Person", video, VIDEO_READING_FREQUENCY)
-        # plot_selections(video, VIDEO_READING_FREQUENCY, samples=dpp_samples, path='text.png')
+        dpp_samples, L = vqa.answer_question("Person", video, video_reading_frequency)
+        # plot_selections(video, video_reading_frequency, samples=dpp_samples, path='text.png')
         prob = vqa.dpp_probability(L, dpp_samples)
         reward = get_user_feedback_annotated(frame_mean_values, dpp_samples)
         loss = -reward * torch.log(prob)
@@ -437,25 +443,77 @@ def TVSum_folder():
 
     print("Done")
 
-def DARPA_folder():
+def DARPA_folder(video_reading_frequency=VIDEO_READING_FREQUENCY):
     vqa = Incremental_VQA_LanguageBind(segment_size=SEGMENT_LENGTH, overlap=OVERLAP, device=device, train=TRAIN)
 
     video_path =  '/scratch3/kat049/user_studies/vids/p17_fr.mp4'
     video = VideoFileClip(video_path)
-    total_frames = int(video.duration)  # Number of seconds (since 1 fps)
+    total_frames = int(video.duration)*video_reading_frequency  # Number of seconds (since 1 fps)
 
     fps = video.fps  # Frames per second
     timestamps = []
-    for i, frame in tqdm.tqdm(enumerate(video.iter_frames(fps=VIDEO_READING_FREQUENCY, dtype="uint8")), total=total_frames, desc="Extracting Frames"):
+    for i, frame in tqdm.tqdm(enumerate(video.iter_frames(fps=video_reading_frequency, dtype="uint8")), total=total_frames, desc="Extracting Frames"):
         vqa.process_new_frame(frame)
         timestamps.append(i)
 
-    dpp_samples, B = vqa.answer_question("Describe the video", video, VIDEO_READING_FREQUENCY)
+    dpp_samples, B = vqa.answer_question("Describe the video", video, video_reading_frequency)
 
     video.close()
 
     print("Done")
 
+def QVHighlights_folder():
+    """Assumption: relevant windows = 1 (only one segment is enough). Relevant windows > 1 (need one segment from each window)"""
+    from data_gen import read_json_file
+    SEGMENT_LENGTH = 8
+    VIDEO_READING_FREQUENCY = int(8/2) # a segment would be 2 seconds
+    OVERLAP = 0
+    VIDEO_FOLDER = '/scratch3/kat049/datasets/QVHighlights/videos'
+    DEVICE = "cuda:2"
+    TRAIN = False
+
+    video_files = [f for f in os.listdir(VIDEO_FOLDER) if f.endswith(('.mp4', '.avi', '.mov'))]
+    vqa = Incremental_VQA_LanguageBind(segment_size=SEGMENT_LENGTH, overlap=OVERLAP, device=DEVICE, train=TRAIN)
+
+
+    json_path = f'/scratch3/kat049/moment_detr/data/highlight_val_release.jsonl'
+    json_data = read_json_file(json_path)
+    json_df = pd.DataFrame(json_data)
+    
+    for _, row in tqdm.tqdm(json_df.iterrows(), total=len(json_df), desc="Processing Videos"):
+        video_file_id = '_'.join(row.vid.split("_")[:-2])
+        video_file = video_file_id + ".mp4"
+        
+        if video_file not in video_files:
+            continue
+        
+        video_path = os.path.join(VIDEO_FOLDER, video_file)
+        # sub_json_df = json_df[json_df.vid.str.startswith(video_file_id)]
+        start_time =  row.vid.split("_")[-2]
+        end_time = row.vid.split("_")[-1]
+        video = VideoFileClip(video_path).subclipped(float(start_time), float(end_time))
+
+        total_frames = int(video.duration)*VIDEO_READING_FREQUENCY
+
+        try:
+            assert row.duration == video.duration
+        except AssertionError:
+            print(f"Duration mismatch: {row.duration} != {video.duration} in {row.qid=}")
+
+        for _, frame in tqdm.tqdm(enumerate(video.iter_frames(fps=VIDEO_READING_FREQUENCY, dtype="uint8")), total=total_frames, desc="Extracting Frames"):
+            vqa.process_new_frame(frame)
+        
+        for v in ['frame_embeddings', 'segment_embeddings']:
+            path_vision_embeddings = f'/scratch3/kat049/datasets/QVHighlights/val/freq{VIDEO_READING_FREQUENCY}_seg{SEGMENT_LENGTH}_overlap{OVERLAP}/qid{row.qid}_{v}.pt'
+            Path(path_vision_embeddings).parent.mkdir(parents=True, exist_ok=True)
+            embeddings = torch.stack(getattr(vqa, v)).detach()
+            torch.save(embeddings, path_vision_embeddings)
+        # vqa.frame_embeddings
+        # vqa.segment_embeddings
+        video.close()
+        # print("Done")
+
+
 if __name__ == "__main__":
-    TVSum_folder()
+    QVHighlights_folder()
 
