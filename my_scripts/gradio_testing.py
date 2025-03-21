@@ -6,7 +6,7 @@ import tqdm
 from incremental_VQA_languagebind import VIDEO_FOLDER
 
 
-MODEL_INFER = True
+MODEL_INFER = False
 
 vid_path2show = os.path.join(VIDEO_FOLDER, 'sTEELN-vY30.mp4')
 video_file = "sTEELN-vY30.mp4"
@@ -75,12 +75,16 @@ def done_selecting_func(selected_indices, imgs, selected_imgs, ignored_imgs):
 def clear_all():
     return None, None, None, None, None, None, None, None, None, None
 
+def clear_with_submit():
+    return None, None, None, None, None, None
+
 def user_feedback_page(title="Help me get better"):
   with gr.Blocks(title=title) as page:
         imgs = gr.State()
         selected_imgs = gr.State()
         ignored_imgs = gr.State()
         selected_indices = gr.State()
+        selected = gr.State()
         gr.Markdown(f"# {title}")
         gr.Markdown("""
             The system will try to pick the best images that matches your query. Some of the images might not be relevant. Some might be repetitive. 
@@ -95,7 +99,7 @@ def user_feedback_page(title="Help me get better"):
             with gr.Row():
                 clear_button = gr.ClearButton([text_input])
                 submit_btn = gr.Button("Submit", variant="primary")
-                submit_btn.click(user_feedback_func, [text_input], [gallery, imgs])
+                
                 text_input.submit(user_feedback_func, [text_input], [gallery, imgs])
                 
         with gr.Row(variant="panel"):
@@ -103,28 +107,29 @@ def user_feedback_page(title="Help me get better"):
 
         with gr.Column(variant="panel"):
             with gr.Row():
-                selected = gr.Number(show_label=False, interactive=False)
-                approve_btn = gr.Button("Approve Selection")
-            deselect_button = gr.Button("Deselect")
+                # selected = gr.Number(show_label=False, interactive=False)
+                approve_btn = gr.Button("Add Selection")
+            # deselect_button = gr.Button("Deselect")
             done_selecting_button = gr.Button("Done Selecting")
 
         gallery.select(get_select_index, None, selected)
 
         with gr.Column(variant="panel"):
             with gr.Row():
-                selected_gallery = gr.Gallery(label="Selected Images", render=False, columns=[5], rows=[4], object_fit="contain", height="auto", preview=True, show_download_button=False, show_share_button=False)
+                selected_gallery = gr.Gallery(label="Selected Images", render=False, columns=[5], rows=[4], object_fit="contain", height="auto", preview=False, show_download_button=False, show_share_button=False)
             with gr.Row():
-                ignored_gallery = gr.Gallery(label="Ignored Images", render=False, columns=[5], rows=[4], object_fit="contain", height="auto", preview=True, show_download_button=False, show_share_button=False)
+                ignored_gallery = gr.Gallery(label="Ignored Images", render=False, columns=[5], rows=[4], object_fit="contain", height="auto", preview=False, show_download_button=False, show_share_button=False)
         
         with gr.Row(variant="panel"):
             selected_gallery.render()
             ignored_gallery.render()
         
         approve_btn.click(add_selected_images, [imgs, selected_imgs, selected, selected_indices],  [selected_imgs, selected_gallery, selected_indices])
-        deselect_button.click(deselect_images, None, gallery)
+        # deselect_button.click(deselect_images, None, gallery)
         done_selecting_button.click(done_selecting_func, [selected_indices, imgs, selected_imgs, ignored_imgs],[gallery, selected_gallery, ignored_gallery])
         clear_button.click(clear_all, None, [text_input, gallery, selected_gallery, ignored_gallery, imgs, selected_imgs, ignored_imgs, selected_indices, selected])
-        
+        submit_btn.click(user_feedback_func, [text_input], [gallery, imgs]).then(clear_with_submit, None, [selected_gallery, ignored_gallery, selected_imgs, ignored_imgs, selected_indices, selected])
+
         gr.Markdown("""
             Below you can find the original video of what happened. 
             It will take a couple of seconds to load.
