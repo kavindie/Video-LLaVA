@@ -109,6 +109,26 @@ def expected_num_frames(*, K=None, L=None):
     else: assert L is None
     return K.trace()
 
+def DPP_loss(K, sampled_set, mask):
+    D_selected, D_ignored = get_user_feedback(samples=sampled_set, mask=mask)
+    logprob_selected_in_sampled = K[D_selected,:][:,D_selected].logdet()
+    logprob_selected_i_in_samples = 0
+    for i in D_ignored:
+        D_selected_i = torch.concat([D_selected, torch.tensor([i])])
+        logprob_selected_i_in_samples += D_selected_i.logdet()
+    return -logprob_selected_in_sampled*(len(D_ignored)+1) + logprob_selected_i_in_samples
+
+
+def dpp_probability(L, samples):
+    L_S = L[samples, :][:, samples] # Extract submatrix
+    try:
+        prob = torch.det(L_S)
+    except Exception as e:
+        print(f"Error calculating determinant: {e}")
+        prob = torch.tensor(1e-6) # To prevent log(0)
+    return prob
+
+
 class ClusterManager:
     def __init__(self, threshold=0.3):  # Threshold is weird
         self.clusters = []  # List of cluster centers (tensors)
@@ -275,14 +295,21 @@ class Incremental_VQA_LanguageBind():
     #     FN = ((~user_mask & mask).float()).mean()
     #     TN = ((~user_mask & ~mask).float()).mean()
     
-    def DPP_loss(K, sampled_set, mask):
-        D_selected, D_ignored = get_user_feedback(samples=sampled_set, mask=mask)
-        logprob_selected_in_sampled = K[D_selected,:][:,D_selected].logdet()
-        logprob_selected_i_in_samples = 0
-        for i in D_ignored:
-            D_selected_i = torch.concat([D_selected, torch.tensor([i])])
-            logprob_selected_i_in_samples += D_selected_i.logdet()
-        return -logprob_selected_in_sampled*(len(D_ignored)+1) + logprob_selected_i_in_samples
+    def get_question_embedding(self, question):
+        language = question
+        inputs = {}     
+        inputs['language'] = to_device(self.tokenizer(language, max_length=77, padding='max_length',
+                                                    truncation=True, return_tensors='pt'), self.device)
+        
+        with torch.no_grad():
+            embeddings = self.LanguageBindModel(inputs)['language'][0]
+        
+        if self.train:
+            embeddings = self.learn_user_preferences(embeddings)
+        else:
+            with torch.no_grad():
+                embeddings = self.learn_user_preferences(embeddings)
+        return embeddings
 
     def answer_question(self, question, video = None, video_reading_frequency = 1, output='images'):
         # inputs can have , output_format='images', user_mask_frames=None, user_mask_segments=None
@@ -357,15 +384,7 @@ class Incremental_VQA_LanguageBind():
         # elif output_format == 'images':
         #     pdf, best_x = compare_embeds(question_embedding, frame_embeddings) 
 
-    def dpp_probability(self, L, samples):
-        L = self.lambda_param * L
-        L_S = L[samples, :][:, samples] # Extract submatrix
-        try:
-            prob = torch.det(L_S)
-        except Exception as e:
-            print(f"Error calculating determinant: {e}")
-            prob = torch.tensor(1e-6) # To prevent log(0)
-        return prob
+
 
 def save_emebeddings(embeddings, embedding_saving_path):
     embeddings = torch.stack(embeddings).detach()
@@ -508,8 +527,9 @@ def QVHighlights_folder():
             Path(path_vision_embeddings).parent.mkdir(parents=True, exist_ok=True)
             embeddings = torch.stack(getattr(vqa, v)).detach()
             torch.save(embeddings, path_vision_embeddings)
-        # vqa.frame_embeddings
-        # vqa.segment_embeddings
+        path_query_embeddings = f'/scratch3/kat049/datasets/QVHighlights/val/freq{VIDEO_READING_FREQUENCY}_seg{SEGMENT_LENGTH}_overlap{OVERLAP}/qid{row.qid}_query_embedding.pt'
+        embeddings = vqa.get_question_embedding(row.query)
+        torch.save(embeddings, path_query_embeddings)
         video.close()
         # print("Done")
 
