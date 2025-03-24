@@ -12,10 +12,13 @@ from pathlib import Path
 from matplotlib import pyplot as plt
 import math
 import torch.optim as optim
+from torch.nn.parallel import parallel_apply
 from dppy.finite_dpps import FiniteDPP
 import gradio as gr
 import time
 import numpy as np
+import functools
+from dpp_utils import *
 
 import os
 import pickle
@@ -51,14 +54,6 @@ def plot_selections(video, video_reading_frequency, samples, path='text.png'):
     plt.savefig(path)
     plt.close()
 
-# standard
-def get_user_feedback(samples, mask):
-    # mask = [True,True,True,True, False, True, False, True,True]
-    not_mask = [not elem for elem in mask]
-    D_selected= torch.tensor(samples)[mask]
-    D_ignored = torch.tensor(samples)[not_mask]
-    # L[D_selected,:][:,D_selected]
-    return D_selected, D_ignored
 
 def get_user_feedback_annotated(frame_mean_values, samples):
     u = frame_mean_values.take(samples)
@@ -67,66 +62,6 @@ def get_user_feedback_annotated(frame_mean_values, samples):
         return 1.0 # thumps up
     else:
         return -1.0 # thumps down
-
-def kernel_diff(frame_embeddings, question_embedding):
-    diff = frame_embeddings - question_embedding
-    number_of_frames = diff.shape[0]
-    L = torch.zeros((number_of_frames, number_of_frames))
-    for i in range(number_of_frames):
-        for j in range(number_of_frames):
-            L[i,j] = (diff[i] @ diff[j].T) / ((diff[i]**2).sum() * (diff[j]**2).sum())
-    diff2 = torch.sum(diff**2, dim=-1)
-    L_prev = (diff @ diff.T) / (diff2 * diff2[:,None])
-    L_new = (diff @ diff.T) / (torch.sqrt(torch.sum(diff**2, dim=1, keepdim=True)) @ torch.sqrt(torch.sum(diff**2, dim=1, keepdim=True)).T)
-
-def kernel_simple(frame_embeddings, question_embedding):
-    """Args:
-        frame_embeddings: Tensor of shape [n_images, 768]
-        question_embedding: Tensor of shape [768]"""
-    
-    # Normalize embeddings
-    frame_embeddings = torch.nn.functional.normalize(frame_embeddings, dim=1)
-    question_embedding = torch.nn.functional.normalize(question_embedding, dim=0)
-
-    # Calculate quality scores (relevance to query)
-    quality_scores = frame_embeddings @ question_embedding
-    
-    # Compute similarity matrix
-    similarity = frame_embeddings @ frame_embeddings.T
-
-    # Create the L-ensemble kernel: L(i,j) = q_i * q_j * S(i,j)
-    L_kernel = quality_scores[:, None] * quality_scores[None, :] * similarity
-
-    # n = len(image_embeddings)
-    # L_kernel = torch.zeros((n, n))    
-    # for i in range(n):
-    #     for j in range(n):
-    #         L_kernel[i, j] = quality_scores[i] * quality_scores[j] * similarity[i, j]
-    return L_kernel
-
-def expected_num_frames(*, K=None, L=None):
-    if K is None: K = torch.linalg.solve(L + torch.eye(len(L), device=L.device), L)
-    else: assert L is None
-    return K.trace()
-
-def DPP_loss(K, sampled_set, mask):
-    D_selected, D_ignored = get_user_feedback(samples=sampled_set, mask=mask)
-    logprob_selected_in_sampled = K[D_selected,:][:,D_selected].logdet()
-    logprob_selected_i_in_samples = 0
-    for i in D_ignored:
-        D_selected_i = torch.concat([D_selected, torch.tensor([i])])
-        logprob_selected_i_in_samples += D_selected_i.logdet()
-    return -logprob_selected_in_sampled*(len(D_ignored)+1) + logprob_selected_i_in_samples
-
-
-def dpp_probability(L, samples):
-    L_S = L[samples, :][:, samples] # Extract submatrix
-    try:
-        prob = torch.det(L_S)
-    except Exception as e:
-        print(f"Error calculating determinant: {e}")
-        prob = torch.tensor(1e-6) # To prevent log(0)
-    return prob
 
 
 class ClusterManager:
@@ -229,6 +164,11 @@ class Incremental_VQA_LanguageBind():
         if trained_output_size is None:
             trained_output_size = 768
         self.learn_user_preferences = UserAdaptation(input_size=768, output_size=trained_output_size, device=self.device)
+
+    def reset(self):
+        self.frames = []
+        self.frame_embeddings = []
+        self.segment_embeddings = []
 
     def process_new_frame(self, frame):
         """frame: np.ndarray"""
@@ -451,7 +391,7 @@ def TVSum_folder(video_reading_frequency=VIDEO_READING_FREQUENCY):
         
         dpp_samples, L = vqa.answer_question("Person", video, video_reading_frequency)
         # plot_selections(video, video_reading_frequency, samples=dpp_samples, path='text.png')
-        prob = vqa.dpp_probability(L, dpp_samples)
+        prob = dpp_probability(L, dpp_samples)
         reward = get_user_feedback_annotated(frame_mean_values, dpp_samples)
         loss = -reward * torch.log(prob)
         loss.backward()
@@ -501,6 +441,9 @@ def QVHighlights_folder():
     
     for _, row in tqdm.tqdm(json_df.iterrows(), total=len(json_df), desc="Processing Videos"):
         video_file_id = '_'.join(row.vid.split("_")[:-2])
+        # if 'W9px1LFMICg' not in video_file_id:
+        #     "frame 204600 - 600, segment:25575 - 75"
+        #     continue
         video_file = video_file_id + ".mp4"
         
         if video_file not in video_files:
@@ -527,9 +470,10 @@ def QVHighlights_folder():
             Path(path_vision_embeddings).parent.mkdir(parents=True, exist_ok=True)
             embeddings = torch.stack(getattr(vqa, v)).detach()
             torch.save(embeddings, path_vision_embeddings)
-        path_query_embeddings = f'/scratch3/kat049/datasets/QVHighlights/val/freq{VIDEO_READING_FREQUENCY}_seg{SEGMENT_LENGTH}_overlap{OVERLAP}/qid{row.qid}_query_embedding.pt'
-        embeddings = vqa.get_question_embedding(row.query)
-        torch.save(embeddings, path_query_embeddings)
+        vqa.reset()
+        # path_query_embeddings = f'/scratch3/kat049/datasets/QVHighlights/val/freq{VIDEO_READING_FREQUENCY}_seg{SEGMENT_LENGTH}_overlap{OVERLAP}/qid{row.qid}_query_embedding.pt'
+        # embeddings = vqa.get_question_embedding(row.query)
+        # torch.save(embeddings, path_query_embeddings)
         video.close()
         # print("Done")
 
