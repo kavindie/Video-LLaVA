@@ -55,6 +55,18 @@ def download_video(url, output_folder="/scratch3/kat049/datasets/QVHighlights/va
 
     #     print(f"Trimmed video saved as: {trimmed_filename}")
 
+def get_video_frames(full_vid_file_name, video_folder, video_reading_frequency):
+    # Get video for plotting
+    video_file_id = '_'.join(full_vid_file_name.split("_")[:-2])
+    video_file = video_file_id + ".mp4"    
+    video_path = os.path.join(video_folder, video_file)
+    start_time =  full_vid_file_name.split("_")[-2]
+    end_time = full_vid_file_name.split("_")[-1]
+    video = VideoFileClip(video_path).subclipped(float(start_time), float(end_time))
+
+    frames = list(video.iter_frames(fps=video_reading_frequency, dtype="uint8"))
+    return video, frames
+    
 if __name__ == "__main__":
     for i in ['val', 'test']:
         json_path = f'/scratch3/kat049/moment_detr/data/highlight_{i}_release.jsonl'

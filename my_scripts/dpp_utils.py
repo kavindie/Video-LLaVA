@@ -99,21 +99,34 @@ def kernel_diff(frame_embeddings, question_embedding):
     L_prev = (diff @ diff.T) / (diff2 * diff2[:,None])
     L_new = (diff @ diff.T) / (torch.sqrt(torch.sum(diff**2, dim=1, keepdim=True)) @ torch.sqrt(torch.sum(diff**2, dim=1, keepdim=True)).T)
 
-def process_single_dpp(L):
+def sample_once(L, dpp):
     "Args: L - square matrix with size frame_numbers x frame_numbers"
-    L_norm = L / L.diag().max()
-    dpp = FiniteDPP("likelihood", L = L_norm.detach().cpu())
-    print('expected_num_frames =', expected_num_frames(L = L_norm))
     while True:
         try:
             samples = dpp.sample_exact()
+            if len(samples) == 0: #TODO get rid of this
+                continue
             break
         except ValueError as e:
-            print(e)
-        print("...trying again...")
-    print('actual   num frames =', len(samples))
+            continue
+    #         print(e)
+    #     print("...trying again...")
+    # print('actual   num frames =', len(samples))
     samples.sort()
-    return L_norm, dpp, samples
+    prob_samples = dpp_probability(L, samples)
+    return samples, prob_samples
+
+def process_single_dpp(L, do_L_norm=False):
+    "Args: L - square matrix with size frame_numbers x frame_numbers"
+    if do_L_norm:
+        L_norm = L / L.diag().max()
+        dpp = FiniteDPP("likelihood", L = L_norm.detach().cpu())
+        samples, prob_samples = sample_once(L_norm, dpp)
+    else:
+        dpp = FiniteDPP("likelihood", L = L.detach().cpu())
+        samples, prob_samples = sample_once(L, dpp)
+        L_norm = None
+    return L_norm, dpp, samples, prob_samples
 
 def kernel_simple(frame_embeddings, question_embedding):
     """Args:
@@ -146,9 +159,8 @@ def dpp_selection(vision_embeddings, question_embedding):
         question_embedding: Tensor of shape [768]
     """
     L = kernel_simple(vision_embeddings, question_embedding)
-    L_norm, dpp, samples = process_single_dpp(L)
+    L_norm, dpp, samples, prob_samples = process_single_dpp(L)
     return L, L_norm, dpp, samples
-
 
 def kernel_simple_batched(frame_embeddings, question_embedding):
     """Args:
@@ -184,7 +196,7 @@ def dpp_generation_batched(vision_embeddings, question_embedding):
     sampless = []
 
     for L_in in L:
-        L_norm, dpp, samples = process_single_dpp(L_in)
+        L_norm, dpp, samples, prob_samples = process_single_dpp(L_in)
         L_norms.append(L_norm)
         dpps.append(dpp)
         sampless.append(samples)
@@ -194,8 +206,8 @@ def dpp_generation_batched(vision_embeddings, question_embedding):
     L_list = [L[i] for i in range(L.shape[0])]    
     results = parallel_apply([functools.partial(process_single_dpp, L_in) for L_in in L_list])
     
-    L_norm, dpp, samples = zip(*results)
-    return L, L_norm, dpp, samples
+    L_norm, dpp, samples, prob_samples = zip(*results)
+    return L, L_norm, dpp, samples, prob_samples
 
 
 def calc_K_from_L(L):
@@ -208,9 +220,8 @@ def expected_num_frames(*, K=None, L=None):
     else: assert L is None
     return K.trace()
 
-
-
 def dpp_probability(L, samples):
+    "Args: L - square matrix with size frame_numbers x frame_numbers which was to define the dpp from which the samples were drawn"
     L_S = L[samples, :][:, samples] # Extract submatrix
     try:
         prob = torch.det(L_S)
