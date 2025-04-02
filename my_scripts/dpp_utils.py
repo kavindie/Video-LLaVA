@@ -128,14 +128,15 @@ def process_single_dpp(L, do_L_norm=False):
         L_norm = None
     return L_norm, dpp, samples, prob_samples
 
-def kernel_simple(frame_embeddings, question_embedding):
+def kernel_simple(frame_embeddings, question_embedding, normalize_inputs=True):
     """Args:
         frame_embeddings: Tensor of shape [n_images, 768]
         question_embedding: Tensor of shape [768]"""
     
     # Normalize embeddings
-    frame_embeddings = torch.nn.functional.normalize(frame_embeddings, dim=-1)
-    question_embedding = torch.nn.functional.normalize(question_embedding, dim=-1)
+    if normalize_inputs:
+        frame_embeddings = torch.nn.functional.normalize(frame_embeddings, dim=-1)
+        question_embedding = torch.nn.functional.normalize(question_embedding, dim=-1)
 
     # Calculate quality scores (relevance to query)
     quality_scores = frame_embeddings @ question_embedding
@@ -162,15 +163,16 @@ def dpp_selection(vision_embeddings, question_embedding):
     L_norm, dpp, samples, prob_samples = process_single_dpp(L)
     return L, L_norm, dpp, samples
 
-def kernel_simple_batched(frame_embeddings, question_embedding):
+def kernel_simple_batched(frame_embeddings, question_embedding, normalize_inputs=True):
     """Args:
         frame_embeddings: Tensor of shape [batch_size, n_images, 768]
         question_embedding: Tensor of shape [batch_size, 768]
     """
     
     # Normalize embeddings
-    frame_embeddings = torch.nn.functional.normalize(frame_embeddings, dim=-1)
-    question_embedding = torch.nn.functional.normalize(question_embedding, dim=-1)
+    if normalize_inputs:
+        frame_embeddings = torch.nn.functional.normalize(frame_embeddings, dim=-1)
+        question_embedding = torch.nn.functional.normalize(question_embedding, dim=-1)
 
     # Calculate quality scores (relevance to query)
     # If input is a (b×n×m) tensor, mat2 is a (b×m×p) tensor, out will be a (b×n×p) tensor.

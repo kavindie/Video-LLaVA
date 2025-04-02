@@ -169,7 +169,10 @@ def groups_from_relevant_windows(relevant_windows):
 
 def qvhighlights_loss_2(L, batch, topk=1, do_L_norm=False):
     """L = [..., n, n]"""
-    for b, _ in enumerate(batch):
+    batch_size = batch['relevant_clip_ids'].shape[0]
+    batch_loss = []
+    # K = calc_K_from_L(L)
+    for b in range(batch_size):
         best_samples = qvhighlights_topk_samples(L[b][None, ...], topk=topk, do_L_norm=do_L_norm)
         relevant_clip_ids = batch['relevant_clip_ids'][b]
         saliency_score = batch['saliency_scores'][b]
@@ -179,6 +182,12 @@ def qvhighlights_loss_2(L, batch, topk=1, do_L_norm=False):
         D_ignored = []
         potential_samples = []
         potential_scores = []
+
+        if best_samples is None:
+            D_selected = []
+            D_ignored = []
+            loss = -dpp_logprob_from_exact(L=L[b], pos=D_selected) + dpp_logprob_from_exact(L=L[b], pos=D_ignored)
+            batch_loss.append(loss)
         
         for s in best_samples:
             if s not in relevant_clip_ids:
@@ -203,6 +212,20 @@ def qvhighlights_loss_2(L, batch, topk=1, do_L_norm=False):
                 D_ignored.append(s)
         D_ignored.sort()
         # get the loss for D_selected = [] and D_ignored = best_samples
+        
+        # D_si = D_selected + D_ignored
+
+        # K_DS = K[b][:, D_selected][D_selected, :]
+        # K_DI = K[b][:, D_ignored][D_ignored, :]
+        # K_DIS = K[b][:, D_si][D_si, :]
+
+        # For now
+        loss = -dpp_logprob_from_exact(L=L[b], pos=D_selected) + dpp_logprob_from_exact(L=L[b], pos=D_ignored)
+        batch_loss.append(loss)
+    
+    return torch.stack(batch_loss).mean()
+        
+       
         
 def qvhighlights_loss(L, batch):
     batched_groups = groups_from_relevant_windows(batch['relevant_windows'])
@@ -320,8 +343,9 @@ def train_loop(num_epochs, model, optimizer, train_dataloader, test_dataloader, 
 
             predicted_clip_embeddings = model(clip_embeddings)
             predicted_query_embedding = model(query_embedding)
-            L = kernel_simple_batched(predicted_clip_embeddings, predicted_query_embedding) 
-            loss = qvhighlights_loss(L, batch)
+            L = kernel_simple_batched(predicted_clip_embeddings, predicted_query_embedding)
+            loss = qvhighlights_loss_2(L, batch, topk=20, do_L_norm=False)
+            # loss = qvhighlights_loss(L, batch)
             loss.backward()
             optimizer.step()
             train_loss += loss.item()
@@ -441,15 +465,15 @@ def prove_my_point(VIDEO_FOLDER, VIDEO_READING_FREQUENCY, SEGMENT_LENGTH, OVERLA
 
             # plot at end
             max_columns = max(len(indices_s), len(best_samples_original), len(best_samples_trained))
-            fig, axs = plt.subplots(3, max_columns)
-            titles = ['Initial Greedy (previous work), DPP - original, DPP - trained']
-            for row, samples in enumerate((indices_s, best_samples_original, best_samples_trained)):
+            fig, axs = plt.subplots(2, max_columns)
+            titles = ['Initial Greedy (previous work)', 'DPP - original', 'DPP - trained']
+            for row, samples in enumerate((indices_s, best_samples_original)): #, best_samples_trained
                 for col, sample in enumerate(samples):
                     axs[row, col].imshow(frames[sample])
                     axs[row, col].axis('off')
                 for col in range(col+1, max_columns):
                     axs[row, col].axis('off')
-                axs[row].set_title(titles[row])
+                axs[row, 0].set_title(titles[row])
             fig.tight_layout()
             plt.suptitle(query)
             plt.savefig('proved.png')
@@ -461,7 +485,7 @@ def main():
     OVERLAP = 0
     # VIDEO_FOLDER = '/scratch3/kat049/datasets/QVHighlights/videos'
     DEVICE = "cuda:2"
-    TRAIN = False
+    TRAIN = True
     json_file = f'/scratch3/kat049/moment_detr/data/highlight_val_release.jsonl'
     embedding_dir = f'/scratch3/kat049/datasets/QVHighlights/val/freq{VIDEO_READING_FREQUENCY}_seg{SEGMENT_LENGTH}_overlap{OVERLAP}'
     num_epochs = 1000
