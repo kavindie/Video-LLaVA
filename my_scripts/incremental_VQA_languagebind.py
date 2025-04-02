@@ -23,6 +23,7 @@ from dpp_utils import *
 import os
 import pickle
 import pandas as pd
+import re
 
 
 SEGMENT_LENGTH = 8  # Segement length in frames
@@ -477,7 +478,32 @@ def QVHighlights_folder():
         video.close()
         # print("Done")
 
+def WildScenes_folder():
+    SEGMENT_LENGTH = 8
+    OVERLAP = 0
+    IMAGE_FOLDER = '/scratch3/kat049/datasets/WildScenes/WildScenes2D/v-02/data/image'
+    DEVICE = "cuda:2"
+    TRAIN = False
+
+    image_files = [f for f in os.listdir(IMAGE_FOLDER) if f.endswith(('.png', '.jpg', '.jpeg'))]
+    sorted_image_files = sorted(image_files, key=lambda x: int(re.match(r'(\d+)-', x).group(1)) if re.match(r'(\d+)-', x) else 0)
+    vqa = Incremental_VQA_LanguageBind(segment_size=SEGMENT_LENGTH, overlap=OVERLAP, device=DEVICE, train=TRAIN)
+
+    for _, file_name in tqdm.tqdm(enumerate(sorted_image_files), total=len(sorted_image_files), desc="Frames"):
+        frame = np.array(Image.open(os.path.join(IMAGE_FOLDER, file_name)))
+        vqa.process_new_frame(frame)
+    
+    for v in ['frame_embeddings', 'segment_embeddings']:
+        path_vision_embeddings = f'/scratch3/kat049/datasets/WildScenes/WildScenes2D/v-02/seg{SEGMENT_LENGTH}_overlap{OVERLAP}/{v}.pt'
+        Path(path_vision_embeddings).parent.mkdir(parents=True, exist_ok=True)
+        embeddings = torch.stack(getattr(vqa, v)).detach()
+        torch.save(embeddings, path_vision_embeddings)
+    vqa.reset()
+    # path_query_embeddings = f'/scratch3/kat049/datasets/QVHighlights/val/freq{VIDEO_READING_FREQUENCY}_seg{SEGMENT_LENGTH}_overlap{OVERLAP}/qid{row.qid}_query_embedding.pt'
+    # embeddings = vqa.get_question_embedding(row.query)
+    # torch.save(embeddings, path_query_embeddings)
+
 
 if __name__ == "__main__":
-    QVHighlights_folder()
+    WildScenes_folder()
 
