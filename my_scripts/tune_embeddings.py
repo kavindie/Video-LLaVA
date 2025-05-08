@@ -235,10 +235,13 @@ def qvhighlights_loss(L, batch):
 def qvhighlights_topk_samples(L, topk=20, do_L_norm=False):
     # Currently only handles one batch
     # L = [1, n, n ]
+    if len(L.shape) == 3:
+        L = L[0]
+    
     max_prob = 0
     best_samples = None
     for k in range(topk):
-        _, _, samples, prob_samples = process_single_dpp(L[0], do_L_norm=do_L_norm)
+        _, _, samples, prob_samples = process_single_dpp(L, do_L_norm=do_L_norm)
         if prob_samples > max_prob:
             max_prob = prob_samples
             best_samples = samples
@@ -298,7 +301,6 @@ def multi_group_accuracy(selected_items, groups):
 
     return max(0.0, min(1.0, final_score)) # ensure the score is in the 0-1 range
 
-
 def qvhighlights_accuracy(L, batch):
     "Not handling empty sets"
     batched_groups = groups_from_relevant_windows(batch['relevant_windows'])
@@ -307,7 +309,6 @@ def qvhighlights_accuracy(L, batch):
 
     total_accuracy = multi_group_accuracy(best_samples, batched_groups)
     return total_accuracy
-
 
 def init(json_file, embedding_dir, train_batch_size=4, test_batch_size=4):
     # Example Usage:
@@ -410,7 +411,6 @@ def eval_loop(model, test_dataloader, device):
             trained_loss.append(qvhighlights_loss(L, batch))
     plot_accuracy_loss(baseline_acc, trained_acc, torch.stack(baseline_loss).detach().cpu(), torch.stack(trained_loss).detach().cpu())
 
-
 def prev_greedy(frame_embeddings, query_embedding, num_items=10):
     import sys
     sys.path.append('/scratch3/kat049/user_studies')
@@ -430,8 +430,7 @@ def prev_greedy(frame_embeddings, query_embedding, num_items=10):
 
     indices_s = torch.tensor(select_items(probabilities_xf, probabilities_ff, num_items=num_items))
     indices_s = indices_s.sort().values.tolist()
-    return indices_s
-
+    return indices_s, probabilities_xf.topk(num_items).indices.sort().values.tolist()
 
 def prove_my_point(VIDEO_FOLDER, VIDEO_READING_FREQUENCY, SEGMENT_LENGTH, OVERLAP, DEVICE, model, test_dataloader, embedding_dir):
     num_items = 5
@@ -450,24 +449,29 @@ def prove_my_point(VIDEO_FOLDER, VIDEO_READING_FREQUENCY, SEGMENT_LENGTH, OVERLA
             # Original way
             frame_embeddings = torch.load(os.path.join(embedding_dir, f"qid{batch['qid'][0]}_frame_embeddings.pt")).to(DEVICE)
             query_embedding = vqa.get_question_embedding(query).to(DEVICE)
-            indices_s = prev_greedy(frame_embeddings, query_embedding, num_items=num_items)
-                
-            # With DPP without training
-            L_originial = kernel_simple_batched(frame_embeddings[None, ...], query_embedding[None, ...])
-            best_samples_original = qvhighlights_topk_samples(L_originial, do_L_norm=do_L_norm)[:num_items]
+            indices_greedy, indices_simple = prev_greedy(frame_embeddings, query_embedding, num_items=num_items)
 
-            # WIth DPP with training
+            # With DPP without training
+            L_original = kernel_simple_batched(frame_embeddings[None, ...], query_embedding[None, ...])
+            best_samples_original = qvhighlights_topk_samples(L_original, do_L_norm=do_L_norm)
+            
+            # best_samples_original = greedy_map_dpp_fast_torch(L_original[0])
+            # if best_samples_original is None:
+            #     input("No samples selected by DPP")
+
+            # WIth DPP with training - not great
             predicted_frame_embeddings = model(frame_embeddings[None, ...])
             predicted_query_embedding = model(query_embedding[None, ...])
             L_trained = kernel_simple_batched(predicted_frame_embeddings, predicted_query_embedding)
-            best_samples_trained = qvhighlights_topk_samples(L_trained, do_L_norm=do_L_norm)[:num_items]
+            best_samples_trained = qvhighlights_topk_samples(L_trained, do_L_norm=do_L_norm)
   
 
             # plot at end
-            max_columns = max(len(indices_s), len(best_samples_original), len(best_samples_trained))
-            fig, axs = plt.subplots(2, max_columns)
-            titles = ['Initial Greedy (previous work)', 'DPP - original', 'DPP - trained']
-            for row, samples in enumerate((indices_s, best_samples_original)): #, best_samples_trained
+            to_plot = (indices_simple, indices_greedy, best_samples_original) # best_samples_trained
+            titles = ['Simple sim based', 'Initial Greedy (previous work)', 'DPP - original']
+            max_columns = max(len(i) for i in to_plot)
+            fig, axs = plt.subplots(len(to_plot), max_columns)
+            for row, samples in enumerate(to_plot): 
                 for col, sample in enumerate(samples):
                     axs[row, col].imshow(frames[sample])
                     axs[row, col].axis('off')
@@ -478,6 +482,45 @@ def prove_my_point(VIDEO_FOLDER, VIDEO_READING_FREQUENCY, SEGMENT_LENGTH, OVERLA
             plt.suptitle(query)
             plt.savefig('proved.png')
             
+def check_dataset():
+    SEGMENT_LENGTH = 8
+    VIDEO_READING_FREQUENCY = int(8/2) # a segment would be 2 seconds
+    OVERLAP = 0
+    VIDEO_FOLDER = '/scratch3/kat049/datasets/QVHighlights/videos'
+    DEVICE = "cuda:2"
+    json_file = f'/scratch3/kat049/moment_detr/data/highlight_val_release.jsonl'
+    embedding_dir = f'/scratch3/kat049/datasets/QVHighlights/val/freq{VIDEO_READING_FREQUENCY}_seg{SEGMENT_LENGTH}_overlap{OVERLAP}'
+    input_size = 768  # Adjust to your embedding size
+    output_size = input_size
+    model = UserAdaptation(input_size, output_size, DEVICE).to(DEVICE)
+    train_dataloader, test_dataloader = init(json_file, embedding_dir, train_batch_size=1, test_batch_size=1)
+    for batch in tqdm(train_dataloader):
+        if batch is None:
+            continue
+        
+        full_vid_file_name = batch['vid'][0]
+        video_file_id = '_'.join(full_vid_file_name.split("_")[:-2])
+        video_file = video_file_id + ".mp4"    
+        video_path = os.path.join(VIDEO_FOLDER, video_file)
+        start_time =  full_vid_file_name.split("_")[-2]
+        end_time = full_vid_file_name.split("_")[-1]
+        video = VideoFileClip(video_path).subclipped(float(start_time), float(end_time))
+
+        relevant_windows = batch['relevant_windows']
+        subclips = []
+        if relevant_windows.shape[1] > 1:
+            for window in relevant_windows[0]:
+                start_time, end_time = window
+                subclip = video.subclipped(float(start_time), float(end_time))
+                subclips.append(subclip)
+                black_frame = ColorClip(size=video.size, color=(0, 0, 0), duration=0.5)
+                subclips.append(black_frame)
+            
+            if subclips:
+                final_clip = concatenate_videoclips(subclips)
+                output_path = os.path.join('/scratch3/kat049/Video-LLaVA/my_scripts/QVHighlights_testing', f"{video_file_id}_{relevant_windows.shape[1]}_relwindows_{batch['query'][0]}.mp4")
+                final_clip.write_videofile(output_path)
+                final_clip.close()
 
 def main():
     SEGMENT_LENGTH = 8
@@ -485,7 +528,7 @@ def main():
     OVERLAP = 0
     # VIDEO_FOLDER = '/scratch3/kat049/datasets/QVHighlights/videos'
     DEVICE = "cuda:2"
-    TRAIN = True
+    TRAIN = False
     json_file = f'/scratch3/kat049/moment_detr/data/highlight_val_release.jsonl'
     embedding_dir = f'/scratch3/kat049/datasets/QVHighlights/val/freq{VIDEO_READING_FREQUENCY}_seg{SEGMENT_LENGTH}_overlap{OVERLAP}'
     num_epochs = 1000
