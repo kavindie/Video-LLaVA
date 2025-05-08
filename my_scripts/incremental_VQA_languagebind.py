@@ -403,24 +403,51 @@ def TVSum_folder(video_reading_frequency=VIDEO_READING_FREQUENCY):
 
     print("Done")
 
+import re
+
+def numerical_sort_key(filename):
+    """Extracts the numerical part of the filename for sorting."""
+    match = re.search(r'_(\d+)\.', filename)
+    if match:
+        return int(match.group(1))
+    return filename  
+
+def Avocado_folder():
+    vqa = Incremental_VQA_LanguageBind(segment_size=SEGMENT_LENGTH, overlap=OVERLAP, device=device, train=TRAIN)
+    video_path = "/scratch3/kat049/user_studies/vids/isairas_2_cut/fps_2/frames"
+    frame_names = [
+    p for p in os.listdir(video_path)
+        if os.path.splitext(p)[-1] in [".jpg", ".jpeg", ".JPG", ".JPEG"]
+    ]
+    frame_names = sorted(frame_names, key=numerical_sort_key)
+    
+    for frame_path in frame_names:
+        image_path = os.path.join(video_path, frame_path)
+        img = Image.open(image_path)
+        frame = np.array(img)
+        vqa.process_new_frame(frame)
+
+    cps_May_demo("avocados", video_path, frame_names, vqa)
+
+
 def DARPA_folder(video_reading_frequency=VIDEO_READING_FREQUENCY):
     vqa = Incremental_VQA_LanguageBind(segment_size=SEGMENT_LENGTH, overlap=OVERLAP, device=device, train=TRAIN)
-
+    
     video_path =  '/scratch3/kat049/user_studies/vids/p17_fr.mp4'
     video = VideoFileClip(video_path)
     total_frames = int(video.duration)*video_reading_frequency  # Number of seconds (since 1 fps)
 
     fps = video.fps  # Frames per second
     timestamps = []
+    frames = []
     for i, frame in tqdm.tqdm(enumerate(video.iter_frames(fps=video_reading_frequency, dtype="uint8")), total=total_frames, desc="Extracting Frames"):
         vqa.process_new_frame(frame)
+        frames.append(frame)
         timestamps.append(i)
-
+        
     dpp_samples, B = vqa.answer_question("Describe the video", video, video_reading_frequency)
-
     video.close()
 
-    print("Done")
 
 def QVHighlights_folder():
     """Assumption: relevant windows = 1 (only one segment is enough). Relevant windows > 1 (need one segment from each window)"""
@@ -479,9 +506,10 @@ def QVHighlights_folder():
         # print("Done")
 
 def WildScenes_folder():
+    VIDEO_NO = 'v-02'
     SEGMENT_LENGTH = 8
-    OVERLAP = 0
-    IMAGE_FOLDER = '/scratch3/kat049/datasets/WildScenes/WildScenes2D/v-02/data/image'
+    OVERLAP = SEGMENT_LENGTH - 1
+    IMAGE_FOLDER = f'/scratch3/kat049/datasets/WildScenes/WildScenes2D/{VIDEO_NO}/data/image'
     DEVICE = "cuda:2"
     TRAIN = False
 
@@ -494,7 +522,7 @@ def WildScenes_folder():
         vqa.process_new_frame(frame)
     
     for v in ['frame_embeddings', 'segment_embeddings']:
-        path_vision_embeddings = f'/scratch3/kat049/datasets/WildScenes/WildScenes2D/v-02/seg{SEGMENT_LENGTH}_overlap{OVERLAP}/{v}.pt'
+        path_vision_embeddings = f'/scratch3/kat049/datasets/WildScenes/WildScenes2D/{VIDEO_NO}/seg{SEGMENT_LENGTH}_overlap{OVERLAP}/{v}.pt'
         Path(path_vision_embeddings).parent.mkdir(parents=True, exist_ok=True)
         embeddings = torch.stack(getattr(vqa, v)).detach()
         torch.save(embeddings, path_vision_embeddings)
@@ -503,7 +531,42 @@ def WildScenes_folder():
     # embeddings = vqa.get_question_embedding(row.query)
     # torch.save(embeddings, path_query_embeddings)
 
+def cps_May_demo(query, video_path, frame_names, vqa):
+    from tune_embeddings import prev_greedy, qvhighlights_topk_samples
+
+    if query is None:
+        query = 'avocados'
+    frame_embeddings = torch.stack(getattr(vqa, 'frame_embeddings')).detach()
+    query_embedding = vqa.get_question_embedding(query)
+
+    num_items = 5
+    do_L_norm = False
+    
+    indices_greedy, indices_simple = prev_greedy(frame_embeddings, query_embedding, num_items=num_items)
+
+    # With DPP without training
+    L_original = kernel_simple_batched(frame_embeddings[None, ...], query_embedding[None, ...])
+    best_samples_original = qvhighlights_topk_samples(L_original, topk=10, do_L_norm=do_L_norm)
+
+    # plot at end
+    to_plot = (indices_greedy, best_samples_original) # best_samples_trained
+    titles = ['Greedy (previous work)', 'Expected']
+    max_columns = max(len(i) for i in to_plot)
+    fig, axs = plt.subplots(len(to_plot), max_columns)
+    for row, samples in enumerate(to_plot): 
+        for col, sample in enumerate(samples):
+            img = Image.open(os.path.join(video_path, frame_names[sample]))
+            axs[row, col].imshow(img)
+            axs[row, col].axis('off')
+        for col in range(col+1, max_columns):
+            axs[row, col].axis('off')
+        axs[row, 0].set_title(titles[row])
+    fig.tight_layout()
+    plt.suptitle(query)
+    plt.savefig('proved.png')
+    plt.close()
 
 if __name__ == "__main__":
-    WildScenes_folder()
+    DARPA_folder()
+    # WildScenes_folder()
 
