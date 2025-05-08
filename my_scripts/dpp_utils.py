@@ -1,5 +1,223 @@
 from dppy.finite_dpps import FiniteDPP
 import torch
+import numpy as np
+
+from torch import log, solve
+
+import numpy as np
+
+def greedy_map_dpp(L, k=None):
+    """
+    Greedy MAP (Maximum A Posteriori) inference for DPP.
+    
+    Args:
+        L: L matrix of shape [m, m]
+        k: number of items to select (optional)
+    
+    Returns:
+        selected_items: list of indices of selected items
+    """
+    n = L.shape[0]
+    
+    ground_set = list(range(n))
+    selected_items = []
+
+    while k is None or len(selected_items) < k:
+        if not ground_set:
+            break
+
+        best_item = None
+        best_det_ratio = -np.inf  # allow any improvement
+
+        for item in ground_set:
+            new_selected = selected_items + [item]
+
+            if len(selected_items) == 0:
+                det_ratio = L[item, item]
+            else:
+                L_Y = L[np.ix_(selected_items, selected_items)]
+                L_Y_x = L[np.ix_(selected_items, [item])]
+                L_x_Y = L_Y_x.T
+                L_xx = L[item, item]
+                
+                try:
+                    schur = L_xx - L_x_Y @ np.linalg.solve(L_Y, L_Y_x)
+                    det_ratio = schur
+                except np.linalg.LinAlgError:
+                    det_ratio = -np.inf  # Skip if L_Y is singular
+
+            if det_ratio > best_det_ratio:
+                best_det_ratio = det_ratio
+                best_item = item
+
+        if best_item is None or best_det_ratio <= 0:
+            break
+
+        selected_items.append(best_item)
+        ground_set.remove(best_item)
+
+    return selected_items
+
+import numpy as np
+
+def greedy_map_dpp_fast(L, k=None, eps=1e-10):
+    """
+    Fast greedy MAP inference for DPP using Cholesky updates.
+    
+    Args:
+        L: L-ensemble matrix (must be symmetric PSD)
+        k: number of items to select (optional)
+        eps: small value for numerical stability
+    
+    Returns:
+        selected_items: list of selected item indices
+    """
+    n = L.shape[0]
+    cis = np.zeros((0, n))  # to store intermediate solutions
+    di2s = np.copy(np.diag(L))  # initial marginal gains
+    selected_items = []
+
+    while k is None or len(selected_items) < k:
+        if len(selected_items) == n or np.all(di2s < eps):
+            break
+
+        # Choose the item with max marginal gain
+        j = np.argmax(di2s)
+        selected_items.append(j)
+
+        # Update cached values
+        cj = (L[j] - cis.T @ cis[:, j]) / np.sqrt(di2s[j])
+        cis = np.vstack([cis, cj])
+        di2s -= cj ** 2
+        di2s[j] = -np.inf  # ensure it won't be picked again
+
+    return selected_items
+
+
+import torch
+
+import torch
+
+def greedy_map_dpp_fast_torch(L, k=None, eps=1e-10):
+    """
+    Fast greedy MAP inference for DPP using Cholesky updates (PyTorch version).
+    
+    Args:
+        L: L-ensemble matrix (torch tensor) [n x n], symmetric and PSD
+        k: number of items to select (optional)
+        eps: small threshold for stopping
+    
+    Returns:
+        selected_items: list of selected indices
+    """
+    n = L.shape[0]
+    device = L.device
+
+    cis = torch.zeros((0, n), device=device)  # Cache for Cholesky-like vectors
+    di2s = torch.diag(L).clone()              # Initial marginal gains
+    selected_items = []
+
+    while k is None or len(selected_items) < k:
+        if len(selected_items) == n or torch.all(di2s < eps):
+            break
+
+        # Select item with maximum marginal gain
+        j = torch.argmax(di2s).item()
+        selected_items.append(j)
+
+        # Update cached values
+        if len(cis) > 0:
+            proj = torch.matmul(cis, L[j])    # Shape: [len(selected),]
+            cj = (L[j] - torch.matmul(proj, cis)) / torch.sqrt(di2s[j])
+        else:
+            cj = L[j] / torch.sqrt(di2s[j])
+
+        cis = torch.cat([cis, cj.unsqueeze(0)], dim=0)
+        di2s = di2s - cj**2
+        di2s[j] = -float('inf')  # prevent re-selection
+
+    return selected_items
+
+
+def greedy_map_dpp_fast_torch_non_muted(L, k=None, eps=1e-10):
+    """
+    Fast greedy MAP inference for DPP using Cholesky updates (PyTorch version).
+    
+    Args:
+        L: L-ensemble matrix (torch tensor) [n x n], symmetric and PSD
+        k: number of items to select (optional)
+        eps: small threshold for stopping
+    
+    Returns:
+        selected_items: list of selected indices
+    """
+    n = L.shape[0]
+    device = L.device
+
+    cis = torch.zeros((0, n), device=device)
+    di2s = torch.diag(L).clone().detach()  # Detach to avoid autograd side-effects
+    selected_items = []
+
+    # Keep track of selected indices
+    already_selected = torch.zeros(n, dtype=torch.bool, device=device)
+
+    while k is None or len(selected_items) < k:
+        if len(selected_items) == n or torch.all(di2s < eps):
+            break
+
+        j = torch.argmax(di2s).item()
+        if di2s[j] < eps:
+            break
+
+        selected_items.append(j)
+        already_selected[j] = True
+
+        # Update Cholesky cache
+        if len(cis) > 0:
+            proj = torch.matmul(cis, L[j])  # [len(selected)]
+            cj = (L[j] - torch.matmul(proj, cis)) / torch.sqrt(di2s[j])
+        else:
+            cj = L[j] / torch.sqrt(di2s[j])
+
+        cis = torch.cat([cis, cj.unsqueeze(0)], dim=0)
+
+        # Compute new marginal gains safely
+        di2s = di2s - cj ** 2
+        di2s[already_selected] = -float('inf')  # prevent re-picking
+
+    return selected_items
+
+
+def marginal_gain(L,A,i):
+    """https://github.com/insuhan/fastdppmap/blob/master/bases/logdet_margin_cg.m"""
+    if len(A) == 0:
+        return log(L[i, i])
+    A = list(A)  # ensure proper indexing
+    LAA = L[np.ix_(A, A)]
+    LAi = L[np.ix_(A, [i])].flatten()
+    Lii = L[i, i]
+    gain = Lii - LAi.T @ solve(LAA, LAi)
+    return log(max(gain, 1e-10))  # prevent log of non-positive values
+
+def dpp_map_greedy(L):
+	"""even dumber version of https://github.com/insuhan/fastdppmap/blob/master/algorithms/greedy_lazy.m"""
+	n = len(L)
+	Y = set(range(n))
+	A = set()
+	while True:
+		delta = {
+			i: marginal_gain(L,A,i)
+			for i in Y - A
+		}
+		best = max(delta, key=delta.get)
+		gain = delta[best]
+		print(f"i: {i}, gain: {gain}")
+		if gain > 0:
+			A.add(best)
+			# A &= {best}
+		else:
+			return A
+          
 
 def DPP_loss(K, sampled_set, mask):
     D_selected, D_ignored = get_user_feedback(samples=sampled_set, mask=mask)
